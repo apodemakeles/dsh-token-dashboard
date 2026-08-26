@@ -10,6 +10,7 @@ class FakeWorker implements WorkerLike {
   failProject = false
   exitOnProject = false
   ackProject = true
+  rejectProject: { code: string; retryable: boolean } | null = null
   terminateCalls = 0
 
   on(event: string, listener: (...args: any[]) => void): unknown {
@@ -33,6 +34,14 @@ class FakeWorker implements WorkerLike {
       }
       if (this.exitOnProject) {
         this.emit('exit', 1)
+        return
+      }
+      if (this.rejectProject !== null) {
+        this.emit('message', {
+          ok: false,
+          requestId: command.requestId,
+          error: { code: this.rejectProject.code, message: this.rejectProject.code, retryable: this.rejectProject.retryable },
+        } satisfies WorkerResult)
         return
       }
       if (this.ackProject) {
@@ -125,6 +134,18 @@ describe('UsageWorkerClient', () => {
     expect(workers.length).toBeGreaterThanOrEqual(2)
     // The redelivered project on the second worker should be acked.
     expect(client.pendingBatchCount).toBe(0)
+  })
+
+  it('drops a deterministically rejected batch from the unacked set', async () => {
+    workers[0]!.rejectProject = { code: 'projection_gap', retryable: false }
+    await expect(client.project(makeBatch(2))).rejects.toMatchObject({ code: 'projection_gap' })
+    expect(client.pendingBatchCount).toBe(0)
+  })
+
+  it('keeps a retryable error batch unacked for redelivery', async () => {
+    workers[0]!.rejectProject = { code: 'worker_error', retryable: true }
+    await expect(client.project(makeBatch(2))).rejects.toMatchObject({ code: 'worker_error' })
+    expect(client.pendingBatchCount).toBe(1)
   })
 
   it('ignores stale acks and does not remove a newer unacked batch', async () => {

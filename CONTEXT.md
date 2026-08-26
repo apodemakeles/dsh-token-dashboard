@@ -19,24 +19,24 @@
 - **投影错误隔离**：Token 数值非法或 Usage 缺少 `turn/step` 等确定性数据错误，在同一事务写入按会话生命周期与事件 `seq` 唯一的 `ingestion_error`、跳过该 fact 并推进 checkpoint；JSONL flush、Worker 或 SQLite 等临时系统错误不得推进 checkpoint。
 - **数据库双版本**：SQLite `PRAGMA user_version` 标识可事务迁移的表结构版本；独立的 `projection_version` 标识 JSONL 到 Usage fact 的解释语义。投影语义不兼容时必须从来源重建，较新数据库被旧插件打开时拒绝写入。
 - **投影初始化状态**：全局 `projection_state` 持久化 `initializing | recovering | ready | degraded | rebuild_required | error`、会话进度与最近错误；每个 Usage checkpoint 持久化 `bootstrap_complete` 和完成扫描时的来源 revision。初始化/恢复中可返回明确标记为不完整的部分统计，完成全部扫描并合并实时事件后才能进入 `ready`。
-- **运行世代 (run epoch)**：每次插件启动先持久化 `arming`，注册监听并暂存实时事件；批量保存当时全部会话 revision 基线后进入 `active`，正常排空后台链路后最后标记 `clean`。上一世代停在 `active` 时只恢复新增或 revision 变化的会话，停在 `arming` 时退化为全会话尾部检查。
+- **运行世代 (run epoch)**：每次插件启动先持久化 `arming`，注册监听并暂存实时事件；批量保存当时全部会话 revision 基线后进入 `active`，正常排空后台链路后最后标记 `clean`。每次启动都对全部当前会话日志做完整性核对：checkpoint 已覆盖当前来源 revision 的会话只比较不读日志，其余（缺失 checkpoint、bootstrap 未完成或 revision 过期）从 checkpoint 之后补扫。
 - **用量库索引策略**：`session_lifecycle` 对生命周期身份唯一约束，`usage_fact` 以 `(lifecycle_pk, turn, step)` 为主键且仅增加 `occurred_at_ms` 时间索引；暂不为只分组不筛选的 provider/model 增加索引，复合主键表优先使用 `WITHOUT ROWID`。
 - **用量快照一致性**：面板查询先越过 SQLite Worker 已入队写消息的队列屏障，再在同一连接的一个只读事务中计算全部统计；查询不触发 DSH flush，也不等待仍在 host 侧落盘的批次，并返回 `asOf`、`pendingBatches` 与投影状态。
 - **投影批次 (projection batch)**：host 不保存或跨线程发送完整 SessionEvent，只发送会话生命周期、连续的 `from_seq/to_seq` 与 provider/model 路由变化、Usage chunk/message 等最小增量；无关事件只推进已检查序号范围，消息正文、工具参数和输出不进入队列。
 - **两级批处理**：host 按会话在最终 Usage message/turn 结束、250ms 空闲、1s 最大年龄或 64 个相关增量时关闭批次并异步 flush 来源；Worker 跨会话最多合并 250ms 或 128 个事实，snapshot/drain 强制立即提交。正常可见延迟目标约 250～500ms 加一次 SQLite 提交耗时。
 - **投影背压**：`session/event` 永不因面板投影而阻塞。未确认相关增量达到 4096 时 Worker 改为立即提交；达到 16384 时停止无限保留并进入 `resync_required`，队列恢复后对受影响生命周期执行 `flush → readFrom(checkpoint + 1)`。受影响集合也溢出时退化为全会话 revision 比对，面板在补齐前明确显示数据落后。
-- **Worker 故障熔断**：可重试故障最多按 100ms、1s、5s 自动重启三次，并根据 SQLite checkpoint 裁掉重投批次的已提交前缀；确定性错误或三次连续失败后本次运行熔断，保留异常 run 状态供下次从 JSONL 恢复。
+- **Worker 故障熔断**：unacked 集合只计已送出未 ack 的 in-flight 批次。可重试故障（Worker 崩溃、RPC 超时）最多按 100ms、1s、5s 自动重启三次，重启后重投 unacked 批次，整体旧于 checkpoint 的批次因幂等成为 no-op；`projection_gap` 等确定性拒绝不算故障，批次立即移出 unacked，恢复由完整性复核负责。连续三次意外退出后本次运行熔断，保留异常 run 状态供下次从 JSONL 恢复。
 - **退出排空**：唯一 async disposer 以 4 秒为正常排空预算，依次停止 admission、关闭 host 批次、等待 DSH flush 链、提交并确认 Worker 批次、最后标记 run clean，再关闭数据库和 Worker；超时或失败时不得标记 clean，交由下次异常恢复。
 - **恢复边界**：已进入权威 JSONL、但尚未提交或尚未 ack 的 SQLite 投影均可通过 revision、checkpoint 与幂等重投恢复；只有硬中断时仍仅存在于 DSH 内存、尚未进入 JSONL 的事件无法由插件恢复。`run_epoch=arming` 必须先于实时 admission 可靠提交。
-- **异常恢复调度**：异常退出后的恢复不阻塞 DSH 启动；以最多两个会话并行比较 revision 并恢复尾部，受影响生命周期的实时事件有界暂存并在恢复后按 seq 合并，不受影响的生命周期继续实时投影。恢复期间状态为 `recovering`，溢出或落后时为 `degraded`。
-- **恢复锚点**：revision 变化时从 checkpoint 自身的 `seq` 读取一条锚点；锚点存在才读取其后的尾部，锚点缺失代表 JSONL 截短或重写，使用 Worker 临时表从 0 重投影并在单事务替换该生命周期。来源中完全消失的会话不自动删除永久 facts。
-- **来源 flush 故障**：DSH flush 失败按会话以 100ms、1s、5s 重试三次，其他会话继续；失败会话随后进入 `degraded/resync_required` 并以 30 秒冷却开启新一轮。恢复时从 checkpoint 后的 JSONL 尾部重新对齐，关闭时仍未恢复则本 run 不得标记 clean。
+- **异常恢复调度**：异常退出后的恢复不阻塞 DSH 启动；完整性核对按会话顺序进行，实时投影不受影响地继续，单会话失败隔离后继续其余会话。恢复期间状态为 `recovering`，溢出或落后时为 `degraded`。运行期间按固定间隔（默认 10 分钟）重复同一完整性核对，无需重启即可补齐实时路径丢失或新增的会话日志。
+- **恢复锚点**：revision 变化时从 checkpoint 的 `seq`+1 起单次读取尾部；日志被截断或重写至 checkpoint 之下时尾部补扫失败并隔离（degraded）。基于锚点核对的从 0 重投影（Worker 临时表单事务替换）为延期设计，首版未实现。来源中完全消失的会话不自动删除永久 facts。
+- **来源 flush 故障**：已从活动会话表移除（dispose）的会话，其缓冲事件在移除前必然已落盘，落盘屏障视为满足，批次直接投影。DSH flush 失败按会话以 100ms、1s、5s 重试三次，其他会话继续；失败会话随后进入 `degraded/resync_required` 并以 30 秒冷却开启新一轮。恢复时从 checkpoint 后的 JSONL 尾部重新对齐，关闭时仍未恢复则本 run 不得标记 clean。
 - **Ready 与告警**：确定性坏事件隔离并追平来源后 phase 可以为 `ready`，snapshot 另返 `warnings.count` 与有限错误摘要；`degraded` 只表示仍有数据落后、队列溢出或可恢复系统故障。
-- **初始化扫描切点**：首次建库在 run arming 后先注册根级实时 listener，再枚举 snapshots；每个会话在自身串行链中按需 flush、`readFrom(0)`，将持久前缀与 listener 暂存的实时增量按 seq 合并，最后事务提交 `bootstrap_complete + source_revision`。初始化不要求全局原子快照或所有会话静止。
+- **初始化扫描切点**：首次建库在 run arming 后先注册根级实时 listener，再枚举 snapshots；每个会话串行单次 `readFrom(0)`（续跑时从 checkpoint 尾部）读整个后缀，内存分块交给 Worker，末块单事务提交 `bootstrap_complete + source_revision`。实时事件不由扫描暂存，而经 collector 并行投影，`(turn, step)` + `source_seq` 幂等去重保证与补扫一致。初始化不要求全局原子快照或所有会话静止。
 - **初始化扫描调度**：历史扫描固定单会话并发，每处理 500 个事件或一个会话主动让出事件循环，并以最多 500 facts 的 bulk batch 交给 Worker；实时队列达到软阈值时暂停历史扫描。公共 `readFrom()` 仍可能因单个不可分割压缩帧短暂占用宿主线程，首版不绕过 DSH API 读取私有文件格式。
-- **初始化来源失败**：单会话临时读取错误按 1s、5s、30s 重试三次；确定性损坏或重试耗尽后隔离并继续其他会话，最终 phase 为 `degraded` 而非 `ready`。下次启动只重试 `bootstrap_complete=false` 的生命周期；全局 `error` 仅表示数据库或 Worker 整体不可用。
+- **初始化来源失败**：单会话读取失败立即隔离（scan_failed）并继续其他会话，最终 phase 为 `degraded` 而非 `ready`；下次启动或周期性复核对重试所有 checkpoint 未覆盖当前来源 revision 的生命周期（含 `bootstrap_complete=false`、checkpoint 缺失或 revision 过期）。全局 `error` 仅表示数据库或 Worker 整体不可用。
 - **初始化与 clean 独立**：正常关闭可取消当前历史读取并保留已提交 checkpoint，取消不算失败；只要实时/flush/Worker 链均已排空，run 可以标记 clean，而 `projection_state` 继续保持 `initializing`，下次从未完成生命周期续跑。
-- **初始化完成门禁**：扫描队列为空后再次枚举 snapshots 收口；仅当所有已发现生命周期均 bootstrap complete、无 failed session、全部初始化批次已 ack 且实时暂存已交接正常队列时，Worker 才在单事务写最终进度、completed_at 与 `ready`。
+- **初始化完成门禁**：final sweep 枚举收口后，仅当所有已发现生命周期均 bootstrap complete、无 failed session 且扫描未被 abort 时，Worker 才在单事务写最终进度、completed_at 与 `ready`；否则 phase 为 `degraded`，下次路径重试。
 - **Snapshot 查询窗口**：单一 GET snapshot 只接受 `weeks`（默认 26，1～52）与 `offsetWeeks`（默认 0，0～10000），固定按运行机器本地时区；不提供 provider/model 筛选或事实 cursor，非法值返回 `bad_query`，未知参数忽略。
 - **Snapshot 统计范围**：summary 始终表示当前 today/7天/30天/全历史，不受翻页影响；days 与顶层 byModel 表示请求的 weeks/offsetWeeks 窗口，days 继续携带逐日 byModel。sessionCount 是至少有一条永久 Usage fact 的会话生命周期数；ready 可带 warnings 且 complete=true，其他追平中状态 complete=false。
 - **Snapshot HTTP 状态**：ready、initializing、recovering、degraded 均返回 200 和当前一致 snapshot，后三者 complete=false；rebuild_required、全局 error、Worker 不可用或超时返回 503 且不提供不可信统计，bad_query 返回 400。浏览器错误只含结构化 code/message/retryable/phase/retryAfter，不泄露路径、日志正文或堆栈。
@@ -50,6 +50,6 @@
 - **Usage checkpoint（用量检查点）**：按会话记录已检查的、连续且已由 DSH 持久化的最后事件 `seq`；同时保存处理完该事件后的 `route_provider/route_model` 路由游标，保证尾部恢复仍能归属后续 Usage。一个连续批次中的 0～N 条用量事实、错误隔离记录与 checkpoint 必须在同一 SQLite 事务中提交，不能跨越事件序号空洞。
 - **来源落盘屏障 (source durability barrier)**：插件在后台批次或 step/turn 边界主动等待 DSH 公共 API `ctx.sessions.flush(session)`；成功后才能提交对应 SQLite 投影，事件本身不携带 JSONL 落盘状态。
 - **运行世代 (run epoch)**：插件从一次启动到正常卸载的运行周期；只有在异步写入队列排空后才标记为干净退出。
-- **异常尾部恢复 (crash-tail recovery)**：上一运行世代未干净退出时，先以会话 revision 变化筛选候选会话，再从各会话 usage checkpoint 之后重放 usage 事件。
+- **异常尾部恢复 (crash-tail recovery)**：每次启动（不论上一运行世代是否干净退出）都核对全部当前会话日志；来源 revision 与 checkpoint 不一致、checkpoint 缺失或 bootstrap 未完成的会话从 checkpoint 之后补扫。
 - **初始化扫描 (initialization scan)**：用量库首次创建时，将已有会话日志一次性投影为 Usage facts 的非阻塞过程；它不是日常查询路径，也不在打开面板时隐式触发。
 - **会话生命周期 (session lifecycle)**：由 DSH 会话的 `session_id + createdAt + cwd` 共同识别的一份具体会话日志；相同 `session_id` 被删除后重建属于新的会话生命周期。

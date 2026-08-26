@@ -155,7 +155,7 @@ classDiagram
   UsageProjector --> SqliteUsageStore
 ```
 
-跨线程协议只含 `init/project/snapshot/drain/shutdown` 五类命令；所有 request/ack 带 protocol version、request id 和 host generation。未知版本、未知命令或失配 generation 必须拒绝，不做兼容猜测。
+跨线程协议含数据命令 `init/project/snapshot/drain/shutdown` 与 run epoch、投影状态管理类命令（`WorkerCommandType`）；所有 request/ack 带 protocol version、request id 和 host generation。未知版本、未知命令或失配 generation 必须拒绝，不做兼容猜测。
 
 SQLite 基线：
 
@@ -308,7 +308,7 @@ sequenceDiagram
   W-->>H: committed(batchId,generation)
 ```
 
-Host 按 `(batch_id,host_generation)` 保留 unacked。Worker crash 最多按 100ms、1s、5s 重启三次。重投时整体旧于 checkpoint 则 no-op，部分重叠裁前缀，连续后缀处理，存在 gap 则 resync。确定性错误或三次失败后熔断，run 保持非 clean。
+Host 按 `(batch_id,host_generation)` 保留 unacked；`pendingBatches` 只计已送出未 ack 的 in-flight 批次。确定性拒绝（projection_gap）的批次立即移出 unacked——它按原样永不会被提交，恢复由完整性复核负责（flush 屏障保证批次事件已入 JSONL）。可重试故障保留条目，Worker 崩溃最多按 100ms、1s、5s 重启三次后重投，整体旧于 checkpoint 的批次因幂等成为 no-op。连续三次意外退出后熔断，run 保持非 clean。
 
 投影核心伪代码：
 
@@ -321,16 +321,23 @@ onCommittedEvent(event) {
 async closeHostBatch(batch) {
   await dsh.sessions.flush(batch.session)
   unacked.put(batch.id, batch)
-  ack = await worker.project(batch)
-  unacked.removeOnlyIfGenerationMatches(ack)
+  try {
+    ack = await worker.project(batch)
+  } catch (error) {
+    if (error.retryable === false) unacked.remove(batch.id) // 确定性 gap：完整性复核负责恢复
+    markResync(batch.lifecycle)
+    return
+  }
+  unacked.remove(batch.id)
 }
 
 worker.project(batch) {
   transaction(() => {
     checkpoint = loadCheckpoint(batch.lifecycle)
-    suffix = requireContinuousSuffixOrNoop(batch, checkpoint)
-    upsertFactsAndErrors(suffix)
-    advanceCheckpointTo(suffix.toSeq, suffix.routeCursor)
+    if (batch.fromSeq > checkpoint + 1) throw projectionGap(batch) // 确定性拒绝
+    if (batch.toSeq <= checkpoint) return noAck // 整体旧于 checkpoint
+    upsertFactsAndErrors(batch)
+    advanceCheckpointTo(batch.toSeq, batch.routeCursor)
     incrementCommitGeneration()
   })
   return committedAck()
@@ -382,7 +389,7 @@ stateDiagram-v2
 
 ## 9. 首次初始化
 
-全历史扫描只在缺库、phase=initializing 续跑或明确 rebuild generation 运行。ready 启动、面板和 snapshot 均不触发。
+全历史扫描只在缺库、phase=initializing 续跑或明确 rebuild generation 运行。每次启动（含 ready 启动）另对全部当前会话日志做完整性核对：checkpoint 已覆盖当前来源 revision 的会话只比较不读日志，缺失 checkpoint、bootstrap 未完成或 revision 过期者从 checkpoint 之后补扫。面板和 snapshot 均不触发。
 
 ```mermaid
 sequenceDiagram
@@ -394,28 +401,25 @@ sequenceDiagram
   H->>H: register root listener
   H->>P: listSnapshots
   loop one lifecycle at a time
-    H->>P: flush active session if needed
-    H->>P: readFrom(0/checkpoint anchor)
+    H->>P: readFrom(0 or checkpoint tail)
     H->>W: <=500 facts per bulk
     W->>S: facts + checkpoint transaction
-    H->>W: merge buffered live by seq
-    W->>S: bootstrap_complete + revision
   end
   H->>P: final listSnapshots sweep
   W->>S: progress + ready in one transaction
 ```
 
-- 历史扫描并发 1；每 500 events/一个会话 yield；live 达 soft pressure 时暂停。
+- 历史扫描并发 1；每 500 events 或一个会话让出事件循环。
 - `readFrom` 可能因单个 Zstd frame 短暂占用 host；首版不绕过 DSH API。
-- 进度只报 discovered/completed/scanning/retrying/failed/pendingLiveBatches，不承诺单调百分比或 ETA。
-- 单会话 read 按 1s、5s、30s 重试；损坏后隔离，整体 degraded。
+- 进度只报 discovered/completed/scanning/retrying/failed 与起止时间戳，不承诺单调百分比或 ETA。
+- 单会话 read 失败立即隔离（scan_failed），下次启动或周期性复核对重试；存在 failed session 时整体 degraded 而非 ready。
 - 正常关闭可 abort 初始化并保持 run clean；projection 仍 initializing，下次续跑。
 
-ready 门禁：队列空、final sweep 完成、全部 bootstrap complete、failed=0、初始化 batch 全 ack、live buffer 已交接，且当前 run active。最终进度、completed_at、ready 在一个事务写入。
+ready 门禁：final sweep 完成、全部已发现生命周期 bootstrap complete、failed=0 且扫描未被 abort。最终进度、completed_at、ready 在一个事务写入，否则 phase 为 degraded。
 
 ## 10. 异常恢复
 
-上一 epoch=active：只恢复相对其 baseline 新增或 revision 变化的生命周期。上一 epoch=arming：baseline 可能不完整，退化为全部当前生命周期。恢复不阻塞启动，最多并行 2 个会话；受影响会话缓存 live，其他会话继续。
+每次启动无论上一 epoch 状态如何，都对全部当前会话日志做完整性核对：来源 revision 与 checkpoint 一致的生命周期不重扫，缺失 checkpoint、bootstrap 未完成或 revision 过期者从 checkpoint 之后补扫。恢复不阻塞启动，单会话顺序处理，让出事件循环；单会话失败隔离后继续其余会话，最终 phase 为 degraded 而非 ready。
 
 ```mermaid
 sequenceDiagram
@@ -424,21 +428,22 @@ sequenceDiagram
   participant W as Worker
   participant S as SQLite
   H->>P: listSnapshots
-  H->>S: previous baselines/checkpoints
-  H->>H: select new/changed lifecycles
-  H->>P: readFrom(checkpoint.last_seq) anchor
-  alt anchor exists
-    H->>P: continuous suffix after anchor
-    H->>W: idempotent tail batches
-  else anchor missing
-    H->>P: readFrom(0)
-    H->>W: build lifecycle temp table
-    W->>S: transactionally replace lifecycle
+  H->>S: lifecycles/checkpoints
+  loop one lifecycle at a time
+    H->>H: verify source revision vs checkpoint
+    alt revision matches and bootstrap complete
+      H->>S: confirmed caught up (no log read)
+    else missing/incomplete/advanced
+      H->>P: readFrom(lastSeq+1) once
+      H->>W: chunked tail batches
+      W->>S: idempotent facts + checkpoint
+    end
   end
-  H->>W: merge live buffer by seq
+  H->>P: final listSnapshots sweep
+  H->>S: failed isolated, ready or degraded
 ```
 
-完全消失的 session 保留永久 facts；同一生命周期仍存在但锚点证明重写时才局部替换。
+完全消失的 session 保留永久 facts。会话日志被截断或重写至 checkpoint 之下时 revision 失配，尾部补扫失败并隔离为 `scan_failed`（degraded）；基于锚点的从 0 重投影为延期设计（见 §19）。
 
 | 中断点 | 结果 |
 |---|---|
@@ -491,7 +496,7 @@ ready/initializing/recovering/degraded 返回 200，后三者 complete=false。r
 
 Worker：先提交已接收 writes，再开一个读事务查询 state/summary/days/models/warnings，commit 后补零并组装。结果可落后仍在 host flush 的一个正常批次，但内部不撕裂。
 
-Host 合并同参数 RPC，LRU 最多 8 个结果；key 包含 query、commit generation、state generation、本地日期。提交/状态变化/跨日失效。HTTP 超时 5 秒，不强杀同步 SQL。
+Host 合并同参数 RPC，LRU 最多 8 个结果；key 包含 query、commit generation、state generation、本地日期。key 取 store *当前* generation（每请求一次 drain hop，无 SQL），提交/状态变化/跨日即产生新 key；若取「上次已服务」的 generation 则失效永不发生（2026-08-26 线上 bug：整天只返回当天第一个快照）。HTTP 超时 5 秒，不强杀同步 SQL。
 
 ## 12. 路径、迁移、重建与 CLI
 
@@ -534,7 +539,7 @@ dsh-token-dashboard cleanup <exact-basename>
 
 | 故障 | Phase/HTTP | 自动动作 | 保证 |
 |---|---|---|---|
-| 单会话 flush 失败 | degraded/200 partial | 3 次退避、30s 冷却、tail resync | 不推进 checkpoint |
+| 单会话 flush 失败 | degraded/200 partial | 已 dispose 会话屏障视为满足直接投影；live 会话 3 次退避、30s 冷却、tail resync | 不推进 checkpoint |
 | Worker 退出 | degraded/200 partial | 3 次退避、重投 | commit/ack 幂等 |
 | Worker 三次失败 | error/503 | 熔断，等下次启动 | run dirty |
 | 初始化单文件损坏 | degraded/200 partial | 隔离、下次重试 | 不伪装完整 |
@@ -574,7 +579,7 @@ Commit 1～8 不接入 root；Commit 9 是行为切换与主要回滚点。每�
 
 ## 16. 验证与验收
 
-故障覆盖：flush 前后、commit/ack、arming/active crash、初始化 abort/live race、overflow、锚点缺失、shutdown timeout、shadow promotion 每一步、owner 竞争、too-new/foreign/corrupt/permission/ENOSPC。每项断言不重复、checkpoint 不越界、错误不伪装 ready、旧库不误删。
+故障覆盖：flush 前后、commit/ack、arming/active crash、初始化 abort/live race、overflow、shutdown timeout、shadow promotion 每一步、owner 竞争、too-new/foreign/corrupt/permission/ENOSPC。每项断言不重复、checkpoint 不越界、错误不伪装 ready、旧库不误删。
 
 真实等价：只读真实 sessions、写临时 SQLite；以当前旧 fold/day-bucket 和 `input+output+cacheRead` 为 oracle，逐 fact/summary/day/model/requests/sessionCount 比较；重放两次结果不变。不输出正文、不改正式数据。
 
@@ -615,7 +620,8 @@ node .scratch/durable-usage-architecture/prototype/tui.mjs --scenario all
 
 ## 19. 已知限制与延期条件
 
-- JSONL backend 的逻辑 tail read 物理上可能解析整文件，但只发生初始化、异常恢复或 resync，不在面板路径。
+- JSONL backend 的逻辑 tail read 物理上可能解析整文件；完整性核对每 pass 对每个会话日志最多读取一次（不按 chunk 重读），且只发生初始化、异常恢复、周期性复核对或 resync，不在面板路径。
+- §10 设计的锚点缺失（日志截断/重写至 checkpoint 之下）路径——Worker 临时表从 0 重投影并在单事务替换该生命周期——首版未实现；当前实现将此类会话隔离为 `scan_failed`（degraded），下次启动或周期性复核对重试。
 - `node:sqlite` 在本机 Node 24.14 仍发 ExperimentalWarning；不全局屏蔽，启动做能力检查。
 - 首版全历史 summary/byModel 仍是 SQL 聚合。只有 100k facts 门禁失败或生产 snapshot 接近 5 秒时才单独设计日 rollup；不得回退扫描 JSONL。
 - 单 owner 意味着同一 DSH Home 的第二 web 进程不能同时提供写服务。

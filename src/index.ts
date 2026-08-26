@@ -12,14 +12,41 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { UsageCollector } from './durable/collector'
+import { UsageCollector, type FlushService, type SessionLike } from './durable/collector'
 import { InitRecoveryCoordinator, WorkerCoordinatorStore } from './durable/init-recovery'
 import { canonicalDbPath, tokenDashboardDir } from './durable/maintenance'
-import { registerSnapshotRoute } from './durable/snapshot-route'
+import { registerSnapshotRoute, type SnapshotProvider } from './durable/snapshot-route'
 import { UsageWorkerClient } from './durable/worker-client'
 
 /** Required services: HTTP routes, persistence seam and live session store. */
 export const inject = ['webServer', 'sessionPersistence', 'sessions']
+
+/** Structural view of the live session store used by the flush barrier. */
+export interface SessionStoreLike {
+  /** Look up a live session by id; `undefined` once the session is disposed. */
+  get(id: string): unknown
+  /** Durability checkpoint for one live session. */
+  flush(session: unknown): Promise<boolean>
+}
+
+/**
+ * Build the collector's source-durability barrier on top of the session store.
+ *
+ * A session that is no longer live in the store has already persisted its
+ * buffered events (the store drains a session before disposal), so its
+ * barrier is already met. Projecting its batch via a bare `flush` call would
+ * make the store reject the disposed session and the collector would drop
+ * the batch with nothing to recover it; live sessions await `flush` as usual.
+ */
+export function createFlushService(sessions: SessionStoreLike): FlushService {
+  return {
+    flush(session: SessionLike): Promise<boolean> {
+      const live = sessions.get(session.id)
+      if (live === undefined) return Promise.resolve(true)
+      return sessions.flush(live)
+    },
+  }
+}
 
 /** Mount the durable projection runtime and the single snapshot route. */
 export function apply(ctx: Context): void {
@@ -31,16 +58,12 @@ export function apply(ctx: Context): void {
     const worker = new UsageWorkerClient({ generation, dbPath: canonicalDbPath(home) })
     const collector = new UsageCollector({
       generation,
-      flush: {
-        flush: (session) => ctx.sessions.flush(session as never),
-      },
+      flush: createFlushService(ctx.sessions),
       worker,
     })
     const coordinator = new InitRecoveryCoordinator({
       store: new WorkerCoordinatorStore(worker),
       persistence: ctx.sessionPersistence,
-      collector,
-      worker,
       generation,
     })
 
@@ -48,7 +71,11 @@ export function apply(ctx: Context): void {
       collector.onEvent(session as never, event as never)
     }
     const disposeListener = ctx.on('session/event', onEvent)
-    const disposeRoutes = registerSnapshotRoute(ctx, worker)
+    const snapshotProvider: SnapshotProvider = {
+      snapshot: (query) => worker.snapshot(query),
+      revision: () => worker.drain(),
+    }
+    const disposeRoutes = registerSnapshotRoute(ctx, snapshotProvider)
 
     void (async () => {
       try {

@@ -6,6 +6,8 @@ A DeepSeek Harness (DSH) web GUI plugin: a token-consumption heatmap panel. It s
 
 > Status: **released [v0.2.0](https://github.com/apodemakeles/dsh-token-dashboard/releases/tag/v0.2.0)** — GitHub distribution is live. The package is not currently published to npm.
 
+> **Fork:** this repository is forked from [`apodemakeles/dsh-token-dashboard`](https://github.com/apodemakeles/dsh-token-dashboard). v0.3.0 re-targets the peer and dev dependency ranges from `0.1.0-rc.6` to `^0.1.0-rc.8` so the plugin typechecks, builds, and loads against DeepSeek Harness **rc.8 and later**. No runtime behavior changed.
+
 ## Screenshots
 
 ### Weekly heatmap
@@ -39,7 +41,7 @@ The npm package is not currently published; use the GitHub installation above.
 - Projection database: `$DSH_HOME/data/token-dashboard/usage-v1.sqlite` (default `~/.dsh`).
 - Total tokens = `inputTokens + outputTokens + cacheReadTokens` (cache reads count into the headline).
 - The panel only calls the snapshot route; it does not trigger `listSnapshots`, `inspect`, `readFrom`, `flush`, or backfill.
-- First startup initializes the database in the background; the panel shows phase/progress until `ready`.
+- Each startup runs a background completeness pass over all session logs (sessions already caught up are verified by revision comparison without reading the log); the panel shows phase/progress until `ready`.
 
 ## Development
 

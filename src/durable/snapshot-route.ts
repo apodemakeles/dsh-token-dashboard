@@ -9,7 +9,10 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import { ErrorCodes, SNAPSHOT_TIMEOUT_MS, type SnapshotQuery, type SnapshotV1 } from './contracts'
 
 export interface SnapshotProvider {
+  /** Query a consistent snapshot of the current store. */
   snapshot(query: SnapshotQuery): Promise<SnapshotV1>
+  /** Current store generation; advances on every committed fact batch and projection state change. */
+  revision(): Promise<{ commitGeneration: number; stateGeneration: number }>
 }
 
 const DEFAULT_WEEKS = 26
@@ -40,8 +43,6 @@ function intOf(params: URLSearchParams, name: string, fallback: number, min: num
 export function registerSnapshotRoute(ctx: Context, provider: SnapshotProvider): () => void {
   const inflight = new Map<string, Promise<SnapshotV1>>()
   const cache = new Map<string, CachedSnapshot>()
-  let lastCommitGeneration = 0
-  let lastStateGeneration = 0
 
   const dispose = (ctx.webServer as unknown as WebRouteLike).register({
     kind: 'exact',
@@ -56,8 +57,14 @@ export function registerSnapshotRoute(ctx: Context, provider: SnapshotProvider):
         const query: SnapshotQuery = { weeks, offsetWeeks }
 
         res.setHeader('cache-control', 'no-store')
+        // Key the cache on the store's CURRENT generation (a drain hop, no
+        // SQL): it advances on every committed fact batch and projection
+        // state change, so new data always produces a new key. Keying on
+        // the last served generation would make the cache permanent until
+        // the local day changes or the host restarts.
+        const revision = await provider.revision()
         const localDate = new Date().toISOString().slice(0, 10)
-        const cacheKey = `${weeks}:${offsetWeeks}:${localDate}:${lastCommitGeneration}:${lastStateGeneration}`
+        const cacheKey = `${weeks}:${offsetWeeks}:${localDate}:${revision.commitGeneration}:${revision.stateGeneration}`
         const cached = cache.get(cacheKey)
         if (cached !== undefined) {
           return ok(res, cached.snapshot)
@@ -75,10 +82,7 @@ export function registerSnapshotRoute(ctx: Context, provider: SnapshotProvider):
         }
         try {
           const snapshot = await snapshotPromise
-          lastCommitGeneration = snapshot.asOf.commitGeneration
-          lastStateGeneration = snapshot.asOf.stateGeneration
-          const resultKey = `${weeks}:${offsetWeeks}:${localDate}:${snapshot.asOf.commitGeneration}:${snapshot.asOf.stateGeneration}`
-          cache.set(resultKey, { snapshot })
+          cache.set(cacheKey, { snapshot })
           if (cache.size > CACHE_MAX) {
             const oldest = cache.keys().next().value
             if (oldest !== undefined) cache.delete(oldest)

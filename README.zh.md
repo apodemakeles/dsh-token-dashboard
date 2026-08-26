@@ -39,7 +39,7 @@ dsh plugin --profile web add github:apodemakeles/dsh-token-dashboard
 - 投影数据库：`$DSH_HOME/data/token-dashboard/usage-v1.sqlite`（缺省 `~/.dsh`）。
 - Total tokens = `inputTokens + outputTokens + cacheReadTokens`（cache read 计入头条）。
 - 面板只调用 snapshot 路由，不触发 `listSnapshots`、`inspect`、`readFrom`、`flush` 或补扫。
-- 首次启动会在后台初始化数据库，面板显示 phase/progress 直到 `ready`。
+- 每次启动都会在后台对全部会话日志做完整性核对（已追平的会话只比较 revision、不读日志），面板显示 phase/progress 直到 `ready`。
 
 ## 开发
 

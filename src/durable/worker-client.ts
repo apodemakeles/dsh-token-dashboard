@@ -153,6 +153,12 @@ export class UsageWorkerClient {
       this.unacked.delete(key)
       return result.value as { committed: boolean; checkpoint: number; commitGeneration: number }
     }
+    // A non-retryable rejection (projection_gap) is deterministic for this
+    // batch: it will never commit as-is, and the completeness rescan owns
+    // recovery — the flush barrier guarantees the batch's events reached the
+    // durable log. Drop the entry so pendingBatchCount only tracks
+    // in-flight commits; retryable failures keep it for redelivery.
+    if (result.error.retryable === false) this.unacked.delete(key)
     throw new WorkerRpcError(result.error.code, result.error.message, result.error.retryable)
   }
 

@@ -1,7 +1,6 @@
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import type { ProjectionBatch, LifecycleIdentity } from './contracts';
 import type { SqliteUsageStore } from './sqlite-store';
-import type { UsageCollector } from './collector';
 import type { UsageWorkerClient } from './worker-client';
 /** Minimal persistence seam shape sufficient for init/recovery. */
 export interface PersistenceLike {
@@ -116,42 +115,75 @@ export declare class SqliteCoordinatorStore implements CoordinatorStore {
 export interface InitRecoveryOptions {
     readonly store: CoordinatorStore;
     readonly persistence: PersistenceLike;
-    readonly collector: UsageCollector;
-    readonly worker: UsageWorkerClient;
     readonly generation: string;
     readonly now?: () => number;
     readonly yieldEvery?: number;
-    readonly maxRecoveryParallel?: number;
+    /**
+     * Interval between completeness re-checks while the host stays up; the
+     * re-check heals source growth or live-path losses without a restart.
+     * 0 disables the periodic re-check.
+     */
+    readonly rescanIntervalMs?: number;
     readonly signal?: AbortSignal;
 }
 export declare class InitRecoveryCoordinator {
     private readonly store;
     private readonly persistence;
-    private readonly collector;
-    private readonly worker;
     private readonly generation;
     private readonly now;
     private readonly yieldEvery;
-    private readonly maxRecoveryParallel;
+    private readonly rescanIntervalMs;
     private readonly signal?;
     private aborted;
-    private started;
     private armed;
+    private scanning;
+    private rescanTimer;
     private snapshots;
-    private previousState;
-    private previousEpochId;
     constructor(options: InitRecoveryOptions);
     get isAborted(): boolean;
     /** Start the coordinator: arm run, activate with baseline, then run scan. */
     start(): Promise<void>;
     /** Arm the run epoch and activate with a revision baseline; no scan yet. */
     arm(): Promise<void>;
-    /** Run initialization/recovery/ready transition after arm(). */
+    /**
+     * Run the completeness pass over the arm-time snapshots and schedule the
+     * periodic re-check. The pass runs on every startup regardless of the
+     * previous epoch state: a run may be marked clean while scans are
+     * incomplete, and the next startup must continue from the incomplete
+     * lifecycles.
+     */
     scan(): Promise<void>;
     /** Abort background scan/recovery; committed work is preserved. */
     abort(): void;
-    private runInitialization;
-    private runRecovery;
+    /** Schedule the next periodic completeness re-check while the host stays up. */
+    private armRescan;
+    /** Re-list the session logs and re-run the completeness pass on a timer. */
+    private periodicRescan;
+    /**
+     * The completeness pass: per current session log, verify the stored
+     * checkpoint already covers the file's current revision (one comparison,
+     * no log read) or (re)scan from the stored checkpoint to the durable tail
+     * and record the caught-up revision. One failing session never blocks the
+     * rest; a failure leaves the lifecycle incomplete so a later pass retries
+     * it. An abort is not a failure: committed checkpoints are preserved and
+     * the next pass resumes from them.
+     */
+    private runCompletenessScan;
+    /**
+     * Project one session log from 'fromSeq' to its current durable tail and
+     * record the snapshot's source revision as caught up on the final batch.
+     *
+     * One readFrom returns every stored event at/after fromSeq, so the pass
+     * reads each session log once per scan and yields between projected
+     * chunks; the file is never re-read per chunk.
+     *
+     * An empty tail is a legitimate caught-up state: a finished session has no
+     * more bytes, and a still-live session's revision changes as it grows, so
+     * the next pass re-enters from the checkpoint and picks up the new tail.
+     * The empty-tail marker is a no-op projection (toSeq < fromSeq) that only
+     * updates the checkpoint's caught-up revision; the store keeps any
+     * concurrently advanced checkpoint and never regresses it.
+     */
     private scanLifecycle;
 }
 //# sourceMappingURL=init-recovery.d.ts.map
