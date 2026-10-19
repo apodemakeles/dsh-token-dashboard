@@ -141,4 +141,47 @@ describe('InitRecoveryCoordinator', () => {
     expect(store.getProjectionProgress().phase).toBe('degraded')
     expect(store.getProjectionProgress().failedSessions).toBe(1)
   })
+
+  it('initializes through a handle-backed persistence service', async () => {
+    const sessions = new Map<string, SessionEvent[]>([
+      ['s1', [usageMessage(0), usageMessage(1)]],
+      ['s2', [usageMessage(0)]],
+    ])
+    const closes: string[] = []
+    const persistence: PersistenceLike = {
+      async list() {
+        return [...sessions.keys()].map((id) => ({
+          header: { id, createdAt: 1000, cwd: '/tmp/project' },
+          revision: 'r1',
+        }))
+      },
+      async open(id: string) {
+        return {
+          header: { id, createdAt: 1000, cwd: '/tmp/project' },
+          async read(offset = 0) {
+            return { events: (sessions.get(id) ?? []).filter((event) => event.seq >= offset) }
+          },
+          async close() {
+            closes.push(id)
+          },
+        }
+      },
+    }
+    const coordinator = new InitRecoveryCoordinator({
+      store: new SqliteCoordinatorStore(store),
+      persistence,
+      collector: dummyCollector(),
+      worker: dummyWorkerClient(),
+      generation: 'g',
+      yieldEvery: 1,
+    })
+    await coordinator.start()
+
+    const progress = store.getProjectionProgress()
+    expect(progress.phase).toBe('ready')
+    expect(progress.completedSessions).toBe(2)
+    expect(store.snapshot({ weeks: 1, offsetWeeks: 0 }, 0).summary.all).toBe(30)
+    // Every lifecycle's read handle was released.
+    expect(closes.sort()).toEqual(['s1', 's1', 's2', 's2'])
+  })
 })

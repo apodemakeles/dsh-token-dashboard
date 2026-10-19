@@ -13,7 +13,7 @@ import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { UsageCollector } from './durable/collector'
-import { InitRecoveryCoordinator, WorkerCoordinatorStore } from './durable/init-recovery'
+import { InitRecoveryCoordinator, WorkerCoordinatorStore, type PersistenceLike } from './durable/init-recovery'
 import { canonicalDbPath, tokenDashboardDir } from './durable/maintenance'
 import { registerSnapshotRoute } from './durable/snapshot-route'
 import { UsageWorkerClient } from './durable/worker-client'
@@ -38,7 +38,9 @@ export function apply(ctx: Context): void {
     })
     const coordinator = new InitRecoveryCoordinator({
       store: new WorkerCoordinatorStore(worker),
-      persistence: ctx.sessionPersistence,
+      // The persistence service is re-shaped between DSH releases; PersistenceSeam
+      // detects the mounted generation and is the only place that reads these fields.
+      persistence: ctx.sessionPersistence as unknown as PersistenceLike,
       collector,
       worker,
       generation,
@@ -50,11 +52,16 @@ export function apply(ctx: Context): void {
     const disposeListener = ctx.on('session/event', onEvent)
     const disposeRoutes = registerSnapshotRoute(ctx, worker)
 
+    // Only a run that armed its epoch may be recorded as a clean exit: a startup
+    // that failed before arming must stay `arming`, so the next run recovers from
+    // the checkpoints instead of trusting this one's silence.
+    let armed = false
     void (async () => {
       try {
         await worker.start()
         await coordinator.arm()
         collector.start()
+        armed = true
         void coordinator.scan().catch((error) => {
           console.error('dsh-token-dashboard: projection scan failed', error)
         })
@@ -69,9 +76,11 @@ export function apply(ctx: Context): void {
       disposeListener()
       await collector.drain()
       await worker.drain()
-      const lastRun = await worker.getLastRunEpoch().catch(() => null)
-      if (lastRun !== null && lastRun.epochId !== undefined) {
-        await worker.markRunClean(lastRun.epochId).catch(() => undefined)
+      if (armed) {
+        const lastRun = await worker.getLastRunEpoch().catch(() => null)
+        if (lastRun !== null && lastRun.epochId !== undefined) {
+          await worker.markRunClean(lastRun.epochId).catch(() => undefined)
+        }
       }
       await worker.shutdown().catch(() => undefined)
       disposeRoutes()

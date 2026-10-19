@@ -3,17 +3,53 @@ import type { ProjectionBatch, LifecycleIdentity } from './contracts';
 import type { SqliteUsageStore } from './sqlite-store';
 import type { UsageCollector } from './collector';
 import type { UsageWorkerClient } from './worker-client';
-/** Minimal persistence seam shape sufficient for init/recovery. */
+/** One stored-session observation: the header identity plus an opaque change token. */
+export interface SessionSnapshotLike {
+    readonly header: {
+        id: string;
+        createdAt?: number;
+        cwd?: string;
+    };
+    readonly revision: unknown;
+}
+/** A read handle from the handle-based persistence generation. */
+export interface ReadHandleLike {
+    readonly header: {
+        id: string;
+        createdAt?: number;
+        cwd?: string;
+    };
+    read(offset?: number, length?: number, options?: {
+        signal?: AbortSignal;
+    }): Promise<{
+        events: SessionEvent[];
+    }>;
+    close(): Promise<void>;
+}
+/**
+ * Minimal persistence seam shape sufficient for init/recovery.
+ *
+ * Two service generations are accepted, because `ctx.sessionPersistence` was
+ * re-shaped after 0.1.0-rc.6 and both are in the field:
+ *
+ * - **handle** (`list`/`open`, shipped by current builds): one snapshot per
+ *   stored session, and a per-session read handle whose `read(offset)` returns
+ *   the logical events from seq `offset` on.
+ * - **snapshot** (`listSnapshots`/`readFrom`, 0.1.0-rc.6): the same
+ *   observations as two direct calls.
+ *
+ * `PersistenceSeam` normalizes both onto one vocabulary; only the methods the
+ * running build provides are ever called.
+ */
 export interface PersistenceLike {
-    listSnapshots(signal?: AbortSignal): Promise<Array<{
-        header: {
-            id: string;
-            createdAt?: number;
-            cwd?: string;
-        };
-        revision: unknown;
-    }>>;
-    readFrom(id: string, fromSeq: number, signal?: AbortSignal): Promise<{
+    list?(options?: {
+        signal?: AbortSignal;
+    }): Promise<ReadonlyArray<SessionSnapshotLike>>;
+    open?(id: string, access: 'read', options?: {
+        signal?: AbortSignal;
+    }): Promise<ReadHandleLike>;
+    listSnapshots?(signal?: AbortSignal): Promise<ReadonlyArray<SessionSnapshotLike>>;
+    readFrom?(id: string, fromSeq: number, signal?: AbortSignal): Promise<{
         meta: {
             id: string;
             createdAt?: number;
@@ -21,6 +57,30 @@ export interface PersistenceLike {
         };
         events: SessionEvent[];
     }>;
+}
+/**
+ * Normalize the persistence generations onto `listSnapshots`/`readFrom`.
+ *
+ * Generation detection is ordered, not feature-sniffed field by field:
+ * 0.1.0-rc.6 exposes `listSnapshots`/`readFrom` *and* a `list()` that returns
+ * bare headers without revisions, so `listSnapshots` decides the generation
+ * and the handle path is taken only when it is absent.
+ *
+ * A handle read opens and closes one handle per call. `open(id, 'read')` never
+ * takes write ownership, so the agent loop keeps its own writer, and closing
+ * promptly keeps no read resources pinned between scan batches. A scan reads a
+ * lifecycle at most twice (the tail, then the empty read that ends the loop).
+ */
+export declare class PersistenceSeam {
+    private readonly persistence;
+    private readonly resolved;
+    constructor(persistence: PersistenceLike);
+    /** Which service generation is mounted; surfaced in startup diagnostics. */
+    get generation(): 'handle' | 'snapshot' | 'unsupported';
+    /** Every stored session visible to this process, in either generation's shape. */
+    listSnapshots(signal?: AbortSignal): Promise<ReadonlyArray<SessionSnapshotLike>>;
+    /** Stored events from seq `fromSeq` on; an empty array means the log ends there. */
+    readFrom(id: string, fromSeq: number, signal?: AbortSignal): Promise<SessionEvent[]>;
 }
 export interface CoordinatorStore {
     getLastRunEpoch(): Promise<{

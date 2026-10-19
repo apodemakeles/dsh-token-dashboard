@@ -61,6 +61,7 @@ SQLite 是可从 DSH JSONL 重建的持久投影，JSONL 仍是权威来源。�
 - **Checkpoint**：已检查、来源已持久化且 SQLite 已提交的最大连续 seq，并携带 route provider/model 游标。
 - **Run epoch**：插件一次运行；只有全部工作排空后才能 clean。
 - **Projection phase**：`initializing | recovering | ready | degraded | rebuild_required | error`。
+- **Persistence seam**：插件读取来源的唯一通道是 `ctx.sessionPersistence`，而该服务在 0.1.0-rc.6 之后改过形。`PersistenceSeam` 把两代归一为「列会话 + 从 seq 读」两个动作：当前构建的 handle 形态（`list()`，以及 `open(id,'read')` 后 `handle.read(seq)` 再 `close()`）与 0.1.0-rc.6 的 snapshot 形态（`listSnapshots()`、`readFrom(id, seq)`）。检测是有序的——0.1.0-rc.6 同时存在 `listSnapshots()` 和一个只返回 header、不带 revision 的 `list()`，所以以 `listSnapshots` 判定该代。两代都没有时启动明确报错，不静默降级。下文用 `list`/`read` 指归一后的动作。
 
 必须始终满足：
 
@@ -70,7 +71,7 @@ SQLite 是可从 DSH JSONL 重建的持久投影，JSONL 仍是权威来源。�
 4. 同一 fact 只按更大/相同 `source_seq` 覆盖，不累加 chunk/message。
 5. clean 时 host pending/unacked/resync 全为空。
 6. complete 只能在 phase=ready 且当前 run 已 active/clean 时发布。
-7. 打开面板不调用 `listSnapshots/inspect/readFrom/flush`。
+7. 打开面板不调用 `list`/`inspect`/`read`/`flush`。
 
 ## 4. 目标组件
 
@@ -350,7 +351,7 @@ worker.project(batch) {
 | delta >=16384 | 停止无限保留，记录 lifecycle，phase=degraded/resync_required |
 | 受影响集合也溢出 | global overflow，恢复时全会话 revision 比对 |
 
-压力解除后 `flush → readFrom(checkpoint+1)`。JSONL 是溢出恢复日志，不增加第二份 journal。
+压力解除后 `flush → read(checkpoint+1)`。JSONL 是溢出恢复日志，不增加第二份 journal。
 
 单会话 flush 失败按 100ms、1s、5s 重试，三次后 30 秒冷却；其他会话继续。成功后从 JSONL 尾部重新对齐。
 
@@ -392,21 +393,21 @@ sequenceDiagram
   participant S as SQLite
   W->>S: schema + run arming
   H->>H: register root listener
-  H->>P: listSnapshots
+  H->>P: list
   loop one lifecycle at a time
     H->>P: flush active session if needed
-    H->>P: readFrom(0/checkpoint anchor)
+    H->>P: read(0/checkpoint anchor)
     H->>W: <=500 facts per bulk
     W->>S: facts + checkpoint transaction
     H->>W: merge buffered live by seq
     W->>S: bootstrap_complete + revision
   end
-  H->>P: final listSnapshots sweep
+  H->>P: final list sweep
   W->>S: progress + ready in one transaction
 ```
 
 - 历史扫描并发 1；每 500 events/一个会话 yield；live 达 soft pressure 时暂停。
-- `readFrom` 可能因单个 Zstd frame 短暂占用 host；首版不绕过 DSH API。
+- `read` 可能因单个 Zstd frame 短暂占用 host；首版不绕过 DSH API。
 - 进度只报 discovered/completed/scanning/retrying/failed/pendingLiveBatches，不承诺单调百分比或 ETA。
 - 单会话 read 按 1s、5s、30s 重试；损坏后隔离，整体 degraded。
 - 正常关闭可 abort 初始化并保持 run clean；projection 仍 initializing，下次续跑。
@@ -423,15 +424,15 @@ sequenceDiagram
   participant P as DSH Persistence
   participant W as Worker
   participant S as SQLite
-  H->>P: listSnapshots
+  H->>P: list
   H->>S: previous baselines/checkpoints
   H->>H: select new/changed lifecycles
-  H->>P: readFrom(checkpoint.last_seq) anchor
+  H->>P: read(checkpoint.last_seq) anchor
   alt anchor exists
     H->>P: continuous suffix after anchor
     H->>W: idempotent tail batches
   else anchor missing
-    H->>P: readFrom(0)
+    H->>P: read(0)
     H->>W: build lifecycle temp table
     W->>S: transactionally replace lifecycle
   end
@@ -589,11 +590,11 @@ Commit 1～8 不接入 root；Commit 9 是行为切换与主要回滚点。每�
 | generation cache hit | p95 <10ms |
 | host delta | 永不超过 16384 |
 
-发布必须验证 `lib/index.js`、`lib/client.js`、`lib/usage-worker.js`、CLI、declarations/sourcemaps，client 仍以 `window.__ModuleLoader__.load` 注册，Git/npm artifact 实际包含 Worker/CLI。link 安装后重启 DSH 验证初始化、刷新、翻页、正常/异常重启和 CLI owner；打开面板 trace 证明无 snapshots/readFrom。
+发布必须验证 `lib/index.js`、`lib/client.js`、`lib/usage-worker.js`、CLI、declarations/sourcemaps，client 仍以 `window.__ModuleLoader__.load` 注册，Git/npm artifact 实际包含 Worker/CLI。link 安装后重启 DSH 验证初始化、刷新、翻页、正常/异常重启和 CLI owner；打开面板 trace 证明无 list/read。
 
 ## 17. 可观测性
 
-本地结构化指标：phase、generations、pending/overflow、flush/commit/snapshot/readFrom latency、batch size、retry/restart/resync、初始化计数、warning codes、DB/WAL/shadow/backup size、rebuild step、shutdown 阶段耗时和 clean/dirty。
+本地结构化指标：phase、generations、pending/overflow、flush/commit/snapshot/read latency、batch size、retry/restart/resync、初始化计数、warning codes、DB/WAL/shadow/backup size、rebuild step、shutdown 阶段耗时和 clean/dirty。
 
 日志不得包含完整 event、prompt 或 tool payload。CLI status 是主要诊断入口；首版不上传 telemetry。
 

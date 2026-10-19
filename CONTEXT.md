@@ -6,10 +6,12 @@
 - **Total tokens**：单日聚合的 token 消耗总量，是热力图格子的唯一指标（v1）；构成口径由产品决策定义（见 .scratch map 05 决议）。
 - **热力图 (heatmap)**：GitHub 贡献图风格的按日聚合色块矩阵；周视图为主，配日视图。
 - **会话日志 (session log)**：DSH 为每个会话记录的 JSONL 事件流（`~/.dsh/sessions/<project>/<session-id>/session.jsonl.zstd`），含逐请求 usage 数据，是本插件唯一数据来源。
-- **用量面板 (usage panel)**：本插件在 DSH Web GUI 侧边栏入口打开的专用面板。
-- **DSH (DeepSeek Harness)**：本插件宿主——Cordis 插件系统驱动的 agent harness，含 web GUI（web profile）。
+- **用量面板 (usage panel)**：本插件在 DSH 侧边栏底部入口点击后打开的专用面板（周视图网格 + 日视图）。
+- **今日胶囊 (today capsule)**：侧边栏底部的常驻入口本体——绿点 + 「今日」+ `summary.today` 的紧凑数字 + 单位，点击打开用量面板。由可见性门控的轻量快照读取刷新（挂载、窗口聚焦、面板关闭、可见期间每 30 秒），隐藏时完全停表。
+- **DSH (DeepSeek Harness)**：本插件宿主——Cordis 插件系统驱动的 agent harness，含 web GUI（web profile）与官方桌面版（Electron 内启动同一个 Web App，使用 desktop profile）。
 - **双半区插件 (dual-face plugin)**：同一个 npm 包导出两个入口的 DSH 插件形态——宿主半区（node 进程，`exports["."]`）与客户端半区（浏览器，`exports["./client"]`）。
-- **profile**：DSH 的一组插件装载配置与依赖集合（如 web profile），由 bundle 层 + 用户 patch 层叠加而成。
+- **profile**：DSH 的一组插件装载配置与依赖集合（如 web profile、桌面版独占的 desktop profile），由 bundle 层 + 用户 patch 层叠加而成。
+- **persistence seam（来源读取缝）**：插件读取会话来源的归一动作——枚举已存会话，然后按 seq 读某个生命周期的后缀。DSH 的 `ctx.sessionPersistence` 跨版本改形（当前构建为 handle 形态，0.1.0-rc.6 为 snapshot 形态），插件用 `PersistenceSeam` 适配两者并在都缺失时明确报错。
 - **bundle patch**：插件随包携带的 `cordis.patch.yml` 清单，声明本包如何插入 profile 的插件树（`dsh.bundle.patch` 字段指向它）。
 - **usage 四桶**：会话日志中单次调用的 token 计量——inputTokens / outputTokens / cacheReadTokens / cacheWrite（本 provider 只出现前三者）。
 - **Usage fact（用量事实）**：从一个已提交的 DSH usage 事件得到的、可幂等持久化的单次模型调用计量记录；持久化 usage 四桶与 `source_seq`，不单独持久化 `total_tokens`，展示总量按 `input + output + cacheRead` 派生。
@@ -24,7 +26,7 @@
 - **用量快照一致性**：面板查询先越过 SQLite Worker 已入队写消息的队列屏障，再在同一连接的一个只读事务中计算全部统计；查询不触发 DSH flush，也不等待仍在 host 侧落盘的批次，并返回 `asOf`、`pendingBatches` 与投影状态。
 - **投影批次 (projection batch)**：host 不保存或跨线程发送完整 SessionEvent，只发送会话生命周期、连续的 `from_seq/to_seq` 与 provider/model 路由变化、Usage chunk/message 等最小增量；无关事件只推进已检查序号范围，消息正文、工具参数和输出不进入队列。
 - **两级批处理**：host 按会话在最终 Usage message/turn 结束、250ms 空闲、1s 最大年龄或 64 个相关增量时关闭批次并异步 flush 来源；Worker 跨会话最多合并 250ms 或 128 个事实，snapshot/drain 强制立即提交。正常可见延迟目标约 250～500ms 加一次 SQLite 提交耗时。
-- **投影背压**：`session/event` 永不因面板投影而阻塞。未确认相关增量达到 4096 时 Worker 改为立即提交；达到 16384 时停止无限保留并进入 `resync_required`，队列恢复后对受影响生命周期执行 `flush → readFrom(checkpoint + 1)`。受影响集合也溢出时退化为全会话 revision 比对，面板在补齐前明确显示数据落后。
+- **投影背压**：`session/event` 永不因面板投影而阻塞。未确认相关增量达到 4096 时 Worker 改为立即提交；达到 16384 时停止无限保留并进入 `resync_required`，队列恢复后对受影响生命周期执行 `flush → read(checkpoint + 1)`。受影响集合也溢出时退化为全会话 revision 比对，面板在补齐前明确显示数据落后。
 - **Worker 故障熔断**：可重试故障最多按 100ms、1s、5s 自动重启三次，并根据 SQLite checkpoint 裁掉重投批次的已提交前缀；确定性错误或三次连续失败后本次运行熔断，保留异常 run 状态供下次从 JSONL 恢复。
 - **退出排空**：唯一 async disposer 以 4 秒为正常排空预算，依次停止 admission、关闭 host 批次、等待 DSH flush 链、提交并确认 Worker 批次、最后标记 run clean，再关闭数据库和 Worker；超时或失败时不得标记 clean，交由下次异常恢复。
 - **恢复边界**：已进入权威 JSONL、但尚未提交或尚未 ack 的 SQLite 投影均可通过 revision、checkpoint 与幂等重投恢复；只有硬中断时仍仅存在于 DSH 内存、尚未进入 JSONL 的事件无法由插件恢复。`run_epoch=arming` 必须先于实时 admission 可靠提交。
@@ -32,8 +34,8 @@
 - **恢复锚点**：revision 变化时从 checkpoint 自身的 `seq` 读取一条锚点；锚点存在才读取其后的尾部，锚点缺失代表 JSONL 截短或重写，使用 Worker 临时表从 0 重投影并在单事务替换该生命周期。来源中完全消失的会话不自动删除永久 facts。
 - **来源 flush 故障**：DSH flush 失败按会话以 100ms、1s、5s 重试三次，其他会话继续；失败会话随后进入 `degraded/resync_required` 并以 30 秒冷却开启新一轮。恢复时从 checkpoint 后的 JSONL 尾部重新对齐，关闭时仍未恢复则本 run 不得标记 clean。
 - **Ready 与告警**：确定性坏事件隔离并追平来源后 phase 可以为 `ready`，snapshot 另返 `warnings.count` 与有限错误摘要；`degraded` 只表示仍有数据落后、队列溢出或可恢复系统故障。
-- **初始化扫描切点**：首次建库在 run arming 后先注册根级实时 listener，再枚举 snapshots；每个会话在自身串行链中按需 flush、`readFrom(0)`，将持久前缀与 listener 暂存的实时增量按 seq 合并，最后事务提交 `bootstrap_complete + source_revision`。初始化不要求全局原子快照或所有会话静止。
-- **初始化扫描调度**：历史扫描固定单会话并发，每处理 500 个事件或一个会话主动让出事件循环，并以最多 500 facts 的 bulk batch 交给 Worker；实时队列达到软阈值时暂停历史扫描。公共 `readFrom()` 仍可能因单个不可分割压缩帧短暂占用宿主线程，首版不绕过 DSH API 读取私有文件格式。
+- **初始化扫描切点**：首次建库在 run arming 后先注册根级实时 listener，再枚举已存会话；每个会话在自身串行链中按需 flush、`read(0)`，将持久前缀与 listener 暂存的实时增量按 seq 合并，最后事务提交 `bootstrap_complete + source_revision`。初始化不要求全局原子快照或所有会话静止。
+- **初始化扫描调度**：历史扫描固定单会话并发，每处理 500 个事件或一个会话主动让出事件循环，并以最多 500 facts 的 bulk batch 交给 Worker；实时队列达到软阈值时暂停历史扫描。公共 `read()` 仍可能因单个不可分割压缩帧短暂占用宿主线程，首版不绕过 DSH API 读取私有文件格式。
 - **初始化来源失败**：单会话临时读取错误按 1s、5s、30s 重试三次；确定性损坏或重试耗尽后隔离并继续其他会话，最终 phase 为 `degraded` 而非 `ready`。下次启动只重试 `bootstrap_complete=false` 的生命周期；全局 `error` 仅表示数据库或 Worker 整体不可用。
 - **初始化与 clean 独立**：正常关闭可取消当前历史读取并保留已提交 checkpoint，取消不算失败；只要实时/flush/Worker 链均已排空，run 可以标记 clean，而 `projection_state` 继续保持 `initializing`，下次从未完成生命周期续跑。
 - **初始化完成门禁**：扫描队列为空后再次枚举 snapshots 收口；仅当所有已发现生命周期均 bootstrap complete、无 failed session、全部初始化批次已 ack 且实时暂存已交接正常队列时，Worker 才在单事务写最终进度、completed_at 与 `ready`。

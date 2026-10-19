@@ -4,6 +4,8 @@
 
 ## 一次性挂载（每台机器一次）
 
+### web profile
+
 在仓库根目录：
 
     dsh plugin --profile web add link:（当前目录绝对路径）
@@ -14,13 +16,23 @@
 
     dsh plugin --profile web remove @apodemakeles/dsh-token-dashboard
 
+### desktop profile（官方桌面版）
+
+桌面版独占 desktop profile，CLI 明确拒绝它（`dsh plugin --profile desktop` → "managed exclusively by the Electron application"），所以照桌面版插件管理器自己的两步走：
+
+    pnpm --dir "${DSH_HOME:-$HOME/.dsh}/profiles/desktop" add link:（当前目录绝对路径）
+    # 然后手工把 @apodemakeles/dsh-token-dashboard 追加进同一份 package.json 的 dsh.profile.bundles
+    # （dsh plugin 的 reconcile 那一步在 desktop profile 没有 CLI 入口）
+
+两条 profile 共用同一个 `$DSH_HOME`，所以桌面版与 dsh web 读同一份 `$DSH_HOME/sessions` 和同一个 `$DSH_HOME/data/token-dashboard/usage-v1.sqlite`：历史不需要迁移，但**同一时刻只允许一个进程持有该库**（第二个进程报 `database_in_use`），联调时别让两边同时跑。
+
 ## 三档改动与生效方式
 
 | 改动内容 | 生效方式 |
 |---|---|
 | client 半区代码（src/client/**） | pnpm watch（tsdown --watch 重建 lib/client.js）→ 浏览器热更（需 harness checkout 里同时跑 pnpm run dev:web 的 HMR receiver）；否则刷新页面 |
-| host 半区代码（src/host/**、src/index.ts） | 重建 lib/index.js 后重启 dsh web |
-| 插件集合/声明（package.json 依赖、cordis.patch.yml、dsh.client 字段） | 重启 dsh web（HMR 只覆盖 bundle 内容，不改变插件集合） |
+| host 半区代码（src/host/**、src/index.ts） | 重建 lib/index.js 后重启 dsh web（桌面版则重启 App） |
+| 插件集合/声明（package.json 依赖、cordis.patch.yml、dsh.client 字段） | 重启 dsh web / 重启桌面版（HMR 只覆盖 bundle 内容，不改变插件集合） |
 
 ## 日常循环
 
@@ -46,7 +58,17 @@ CLI 冒烟：
     dsh-token-dashboard status
     dsh-token-dashboard verify
 
-client 半区：GUI 侧边栏出现 Token 入口，点击打开热力图面板。
+client 半区：GUI 侧边栏底部出现 usage 入口，点击打开热力图面板。
+
+桌面版联调：不重启 App 也能先跑隔离验证——把 profile 目录复制成另一个名字（CLI 只拒绝字面上的 desktop），再用 App 自带运行时启动它：
+
+    cp -R "$DSH_HOME/profiles/desktop" "$DSH_HOME/profiles/desktop-verify"
+    ELECTRON_RUN_AS_NODE=1 DSH_HOME=$HOME/.dsh \
+      "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" --expose-internals \
+      "/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" \
+      --profile desktop-verify --no-open --port 19488
+
+日志会打印带 token 的 URL，用它请求 /api/token-dashboard/snapshot 即可核对 phase/summary。要验证「从零重建」而不动真实库，把 DSH_HOME 指到一个只含 sessions 克隆的临时 home 即可（该 home 里用 profiles/desktop-verify 软链回真实 profile 目录）。
 
 单测：pnpm test（含本机真实会话日志交叉核对，每次改动前跑一遍）。
 

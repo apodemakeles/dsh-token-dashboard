@@ -1,8 +1,8 @@
 // InitRecoveryCoordinator — background initialization and crash-tail recovery.
 //
-// It uses only the DSH persistence seam (listSnapshots/readFrom) plus the
-// collector and Worker client. It never touches physical JSONL/Zstd paths and
-// never runs on the panel request path.
+// It uses only the DSH persistence seam plus the collector and Worker client.
+// It never touches physical JSONL/Zstd paths and never runs on the panel
+// request path.
 
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ProjectionBatch, LifecycleIdentity } from './contracts'
@@ -11,10 +11,91 @@ import type { SqliteUsageStore } from './sqlite-store'
 import type { UsageCollector } from './collector'
 import type { UsageWorkerClient } from './worker-client'
 
-/** Minimal persistence seam shape sufficient for init/recovery. */
+/** One stored-session observation: the header identity plus an opaque change token. */
+export interface SessionSnapshotLike {
+  readonly header: { id: string; createdAt?: number; cwd?: string }
+  readonly revision: unknown
+}
+
+/** A read handle from the handle-based persistence generation. */
+export interface ReadHandleLike {
+  readonly header: { id: string; createdAt?: number; cwd?: string }
+  read(offset?: number, length?: number, options?: { signal?: AbortSignal }): Promise<{ events: SessionEvent[] }>
+  close(): Promise<void>
+}
+
+/**
+ * Minimal persistence seam shape sufficient for init/recovery.
+ *
+ * Two service generations are accepted, because `ctx.sessionPersistence` was
+ * re-shaped after 0.1.0-rc.6 and both are in the field:
+ *
+ * - **handle** (`list`/`open`, shipped by current builds): one snapshot per
+ *   stored session, and a per-session read handle whose `read(offset)` returns
+ *   the logical events from seq `offset` on.
+ * - **snapshot** (`listSnapshots`/`readFrom`, 0.1.0-rc.6): the same
+ *   observations as two direct calls.
+ *
+ * `PersistenceSeam` normalizes both onto one vocabulary; only the methods the
+ * running build provides are ever called.
+ */
 export interface PersistenceLike {
-  listSnapshots(signal?: AbortSignal): Promise<Array<{ header: { id: string; createdAt?: number; cwd?: string }; revision: unknown }>>
-  readFrom(id: string, fromSeq: number, signal?: AbortSignal): Promise<{ meta: { id: string; createdAt?: number; cwd?: string }; events: SessionEvent[] }>
+  list?(options?: { signal?: AbortSignal }): Promise<ReadonlyArray<SessionSnapshotLike>>
+  open?(id: string, access: 'read', options?: { signal?: AbortSignal }): Promise<ReadHandleLike>
+  listSnapshots?(signal?: AbortSignal): Promise<ReadonlyArray<SessionSnapshotLike>>
+  readFrom?(id: string, fromSeq: number, signal?: AbortSignal): Promise<{ meta: { id: string; createdAt?: number; cwd?: string }; events: SessionEvent[] }>
+}
+
+/**
+ * Normalize the persistence generations onto `listSnapshots`/`readFrom`.
+ *
+ * Generation detection is ordered, not feature-sniffed field by field:
+ * 0.1.0-rc.6 exposes `listSnapshots`/`readFrom` *and* a `list()` that returns
+ * bare headers without revisions, so `listSnapshots` decides the generation
+ * and the handle path is taken only when it is absent.
+ *
+ * A handle read opens and closes one handle per call. `open(id, 'read')` never
+ * takes write ownership, so the agent loop keeps its own writer, and closing
+ * promptly keeps no read resources pinned between scan batches. A scan reads a
+ * lifecycle at most twice (the tail, then the empty read that ends the loop).
+ */
+export class PersistenceSeam {
+  private readonly persistence: PersistenceLike
+  private readonly resolved: 'handle' | 'snapshot' | 'unsupported'
+
+  constructor(persistence: PersistenceLike) {
+    this.persistence = persistence
+    if (typeof persistence.listSnapshots === 'function' && typeof persistence.readFrom === 'function') this.resolved = 'snapshot'
+    else if (typeof persistence.list === 'function' && typeof persistence.open === 'function') this.resolved = 'handle'
+    else this.resolved = 'unsupported'
+  }
+
+  /** Which service generation is mounted; surfaced in startup diagnostics. */
+  get generation(): 'handle' | 'snapshot' | 'unsupported' {
+    return this.resolved
+  }
+
+  /** Every stored session visible to this process, in either generation's shape. */
+  async listSnapshots(signal?: AbortSignal): Promise<ReadonlyArray<SessionSnapshotLike>> {
+    if (this.resolved === 'snapshot') return await this.persistence.listSnapshots!(signal)
+    if (this.resolved === 'handle') return await this.persistence.list!({ signal })
+    throw new Error('dsh-token-dashboard: ctx.sessionPersistence exposes neither listSnapshots() nor list()')
+  }
+
+  /** Stored events from seq `fromSeq` on; an empty array means the log ends there. */
+  async readFrom(id: string, fromSeq: number, signal?: AbortSignal): Promise<SessionEvent[]> {
+    if (this.resolved === 'snapshot') return (await this.persistence.readFrom!(id, fromSeq, signal)).events
+    if (this.resolved === 'handle') {
+      const handle = await this.persistence.open!(id, 'read', { signal })
+      try {
+        const read = await handle.read(fromSeq, undefined, { signal })
+        return read.events
+      } finally {
+        await handle.close().catch(() => undefined)
+      }
+    }
+    throw new Error('dsh-token-dashboard: ctx.sessionPersistence exposes neither readFrom() nor open()')
+  }
 }
 
 export interface CoordinatorStore {
@@ -100,7 +181,7 @@ const DEFAULT_MAX_RECOVERY_PARALLEL = 2
 
 export class InitRecoveryCoordinator {
   private readonly store: CoordinatorStore
-  private readonly persistence: PersistenceLike
+  private readonly persistence: PersistenceSeam
   private readonly collector: UsageCollector
   private readonly worker: UsageWorkerClient
   private readonly generation: string
@@ -111,13 +192,13 @@ export class InitRecoveryCoordinator {
   private aborted = false
   private started = false
   private armed = false
-  private snapshots: Array<{ header: { id: string; createdAt?: number; cwd?: string }; revision: unknown }> = []
+  private snapshots: ReadonlyArray<SessionSnapshotLike> = []
   private previousState: 'arming' | 'active' | 'clean' | undefined
   private previousEpochId: number | undefined
 
   constructor(options: InitRecoveryOptions) {
     this.store = options.store
-    this.persistence = options.persistence
+    this.persistence = new PersistenceSeam(options.persistence)
     this.collector = options.collector
     this.worker = options.worker
     this.generation = options.generation
@@ -181,7 +262,7 @@ export class InitRecoveryCoordinator {
     this.aborted = true
   }
 
-  private async runInitialization(snapshots: ReadonlyArray<{ header: { id: string; createdAt?: number; cwd?: string }; revision: unknown }>): Promise<void> {
+  private async runInitialization(snapshots: ReadonlyArray<SessionSnapshotLike>): Promise<void> {
     if (this.aborted) return
     await this.store.updateProjectionProgress({
       phase: 'initializing',
@@ -195,6 +276,7 @@ export class InitRecoveryCoordinator {
 
     let failed = 0
     const failedIds = new Set<string>()
+    const reasons = new FailureLog()
     for (let index = 0; index < snapshots.length; index += 1) {
       if (this.aborted) return
       const snapshot = snapshots[index]!
@@ -211,9 +293,10 @@ export class InitRecoveryCoordinator {
             scanningSessions: 0,
           }, this.now())
         }
-      } catch {
+      } catch (error) {
         failed += 1
         failedIds.add(snapshot.header.id)
+        reasons.record(snapshot.header.id, error)
         await this.store.updateProjectionProgress({ scanningSessions: 0, failedSessions: failed }, this.now())
       }
     }
@@ -235,11 +318,13 @@ export class InitRecoveryCoordinator {
           discoveredSessions: Math.max(progress.discoveredSessions, finalSnapshots.length),
           completedSessions: progress.completedSessions + 1,
         }, this.now())
-      } catch {
+      } catch (error) {
         failed += 1
         failedIds.add(snapshot.header.id)
+        reasons.record(snapshot.header.id, error)
       }
     }
+    reasons.report()
 
     const progress = await this.store.getProjectionProgress()
     if (failed === 0 && !this.aborted) {
@@ -257,7 +342,7 @@ export class InitRecoveryCoordinator {
   private async runRecovery(
     previousState: 'arming' | 'active',
     previousEpochId: number | undefined,
-    currentSnapshots: ReadonlyArray<{ header: { id: string; createdAt?: number; cwd?: string }; revision: unknown }>,
+    currentSnapshots: ReadonlyArray<SessionSnapshotLike>,
     baselines: ReadonlyArray<{ lifecyclePk: number; sourceRevision: string }>,
   ): Promise<void> {
     if (this.aborted) return
@@ -268,7 +353,7 @@ export class InitRecoveryCoordinator {
     }, this.now())
 
     const previousBaselines = previousState === 'active' && previousEpochId !== undefined ? await this.store.getBaselines(previousEpochId) : []
-    const candidates: Array<{ header: { id: string; createdAt?: number; cwd?: string }; revision: unknown }> = []
+    const candidates: Array<SessionSnapshotLike> = []
     for (const snapshot of currentSnapshots) {
       if (previousState === 'arming') {
         candidates.push(snapshot)
@@ -281,6 +366,7 @@ export class InitRecoveryCoordinator {
     }
 
     let failed = 0
+    const reasons = new FailureLog()
     const queue = [...candidates]
     const workers: Promise<void>[] = []
     const runOne = async (): Promise<void> => {
@@ -289,8 +375,9 @@ export class InitRecoveryCoordinator {
         try {
           const checkpoint = await this.store.getCheckpoint(await this.store.upsertLifecycle(identityFromSnapshot(snapshot)))
           await this.scanLifecycle(snapshot, checkpoint.lastSeq + 1, false)
-        } catch {
+        } catch (error) {
           failed += 1
+          reasons.record(snapshot.header.id, error)
         }
       }
     }
@@ -298,6 +385,7 @@ export class InitRecoveryCoordinator {
       workers.push(runOne())
     }
     await Promise.all(workers)
+    reasons.report()
 
     const progress = await this.store.getProjectionProgress()
     if (failed === 0 && !this.aborted) {
@@ -308,7 +396,7 @@ export class InitRecoveryCoordinator {
   }
 
   private async scanLifecycle(
-    snapshot: { header: { id: string; createdAt?: number; cwd?: string }; revision: unknown },
+    snapshot: SessionSnapshotLike,
     fromSeq: number,
     bootstrap: boolean,
   ): Promise<boolean> {
@@ -317,8 +405,8 @@ export class InitRecoveryCoordinator {
     let cursor = fromSeq
     let index = 0
     while (!this.aborted) {
-      const read = await this.persistence.readFrom(identity.sessionId, cursor, this.signal)
-      if (read.events.length === 0) {
+      const events = await this.persistence.readFrom(identity.sessionId, cursor, this.signal)
+      if (events.length === 0) {
         if (bootstrap) {
           await this.store.projectBatch({
             batchId: this.generation + ':bootstrap:' + identity.sessionId + ':' + cursor,
@@ -333,12 +421,12 @@ export class InitRecoveryCoordinator {
         }
         return true
       }
-      for (let offset = 0; offset < read.events.length; offset += this.yieldEvery) {
+      for (let offset = 0; offset < events.length; offset += this.yieldEvery) {
         if (this.aborted) return false
-        const chunk = read.events.slice(offset, offset + this.yieldEvery)
+        const chunk = events.slice(offset, offset + this.yieldEvery)
         const first = chunk[0]!
         const last = chunk[chunk.length - 1]!
-        const isLastChunk = offset + chunk.length >= read.events.length
+        const isLastChunk = offset + chunk.length >= events.length
         await this.store.projectBatch({
           batchId: this.generation + ':scan:' + identity.sessionId + ':' + first.seq + '-' + last.seq,
           hostGeneration: this.generation,
@@ -358,10 +446,41 @@ export class InitRecoveryCoordinator {
 
 }
 
-function identityFromSnapshot(snapshot: { header: { id: string; createdAt?: number; cwd?: string }; revision: unknown }): LifecycleIdentity {
+function identityFromSnapshot(snapshot: SessionSnapshotLike): LifecycleIdentity {
   return {
     sessionId: snapshot.header.id,
     createdAtMs: snapshot.header.createdAt ?? 0,
     cwd: snapshot.header.cwd ?? '',
+  }
+}
+
+/**
+ * Bounded per-session failure report.
+ *
+ * A scan fails per lifecycle — an unreadable or uninterpretable log is isolated
+ * so the remaining sessions still project — but the phase only ever carries a
+ * count. Naming a few causes is what makes `degraded` actionable; the bound
+ * keeps a wholesale-unreadable corpus from flooding the host log.
+ */
+const MAX_REPORTED_FAILURES = 5
+
+class FailureLog {
+  private readonly entries: Array<{ id: string; reason: string }> = []
+  private total = 0
+
+  record(id: string, error: unknown): void {
+    this.total += 1
+    if (this.entries.length < MAX_REPORTED_FAILURES) {
+      this.entries.push({ id, reason: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  report(): void {
+    if (this.total === 0) return
+    console.error(`dsh-token-dashboard: ${this.total} session(s) could not be projected; the rest of the history is unaffected`)
+    for (const entry of this.entries) console.error(`dsh-token-dashboard:   ${entry.id}: ${entry.reason}`)
+    if (this.total > this.entries.length) {
+      console.error(`dsh-token-dashboard:   …and ${this.total - this.entries.length} more`)
+    }
   }
 }

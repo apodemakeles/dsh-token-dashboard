@@ -31,6 +31,10 @@ function sessionFiles(): string[] {
 const FILES = sessionFiles()
 const runnable = existsSync(ZSTD) && FILES.length > 0
 
+// This suite zstd-decodes every materialized log on the machine, so its cost
+// grows with the corpus and is unrelated to the code under test.
+const REAL_CORPUS_TIMEOUT_MS = 180_000
+
 interface RawLine {
   type?: string
   seq?: number
@@ -92,7 +96,7 @@ describe.skipIf(!runnable)('real session logs', () => {
     // The machine really has history: the fold must have found usage samples.
     expect(checkedSteps).toBeGreaterThan(0)
     expect(checkedTotal).toBeGreaterThan(0)
-  })
+  }, REAL_CORPUS_TIMEOUT_MS)
 
   it('fold samples carry non-negative token buckets (cache included by design)', () => {
     for (const file of FILES.slice(0, 5)) {
