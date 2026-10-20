@@ -9,6 +9,7 @@ import {
   DRAIN_TIMEOUT_MS,
   PROTOCOL_VERSION,
   SNAPSHOT_TIMEOUT_MS,
+  type GenerationInfo,
   type LifecycleIdentity,
   type ProjectionBatch,
   type SnapshotQuery,
@@ -173,8 +174,23 @@ export class UsageWorkerClient {
     throw new WorkerRpcError(result.error.code, result.error.message, result.error.retryable)
   }
 
+  /** Current store generations, used to key the snapshot cache without running a query. */
+  async getGeneration(): Promise<GenerationInfo> {
+    if (this.circuitOpen) throw new Error('worker circuit open')
+    await this.start()
+    const command: WorkerCommand = {
+      type: 'get_generation',
+      requestId: this.nextRequestId(),
+      hostGeneration: this.generation,
+      protocolVersion: PROTOCOL_VERSION,
+    }
+    const result = await this.request(command, SNAPSHOT_TIMEOUT_MS)
+    if (result.ok) return result.value as GenerationInfo
+    throw new WorkerRpcError(result.error.code, result.error.message, result.error.retryable)
+  }
+
   /** Barrier: all previously sent commands have committed. */
-  async drain(): Promise<{ commitGeneration: number; stateGeneration: number }> {
+  async drain(): Promise<GenerationInfo> {
     if (this.circuitOpen) throw new Error('worker circuit open')
     await this.start()
     const command: WorkerCommand = {
@@ -184,7 +200,7 @@ export class UsageWorkerClient {
       protocolVersion: PROTOCOL_VERSION,
     }
     const result = await this.request(command, DRAIN_TIMEOUT_MS)
-    if (result.ok) return result.value as { commitGeneration: number; stateGeneration: number }
+    if (result.ok) return result.value as GenerationInfo
     throw new WorkerRpcError(result.error.code, result.error.message, result.error.retryable)
   }
 

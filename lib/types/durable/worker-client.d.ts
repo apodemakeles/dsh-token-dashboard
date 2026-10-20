@@ -1,4 +1,4 @@
-import { type LifecycleIdentity, type ProjectionBatch, type SnapshotQuery, type SnapshotV1 } from './contracts';
+import { type GenerationInfo, type LifecycleIdentity, type ProjectionBatch, type SnapshotQuery, type SnapshotV1 } from './contracts';
 /** Minimal Worker-like surface used by tests. */
 export interface WorkerLike {
     postMessage(value: unknown): void;
@@ -68,11 +68,10 @@ export declare class UsageWorkerClient {
     }>;
     /** Query a consistent snapshot. */
     snapshot(query: SnapshotQuery): Promise<SnapshotV1>;
+    /** Current store generations, used to key the snapshot cache without running a query. */
+    getGeneration(): Promise<GenerationInfo>;
     /** Barrier: all previously sent commands have committed. */
-    drain(): Promise<{
-        commitGeneration: number;
-        stateGeneration: number;
-    }>;
+    drain(): Promise<GenerationInfo>;
     beginRunEpoch(startedAtMs?: number): Promise<number>;
     activateRunEpoch(epochId: number, baselines: ReadonlyArray<{
         lifecyclePk: number;

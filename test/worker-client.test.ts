@@ -52,6 +52,14 @@ class FakeWorker implements WorkerLike {
       } satisfies WorkerResult)
       return
     }
+    if (command.type === 'get_generation') {
+      this.emit('message', {
+        ok: true,
+        requestId: command.requestId,
+        value: { commitGeneration: 1, stateGeneration: 1 },
+      } satisfies WorkerResult)
+      return
+    }
     if (command.type === 'drain' || command.type === 'shutdown') {
       this.emit('message', { ok: true, requestId: command.requestId, value: { ok: true } } satisfies WorkerResult)
     }
@@ -112,6 +120,7 @@ describe('UsageWorkerClient', () => {
     expect(ack.committed).toBe(true)
     expect(client.pendingBatchCount).toBe(0)
     await client.snapshot({ weeks: 1, offsetWeeks: 0 })
+    await expect(client.getGeneration()).resolves.toEqual({ commitGeneration: 1, stateGeneration: 1 })
     const drain = await client.drain()
     expect(drain).toBeTypeOf('object')
   })

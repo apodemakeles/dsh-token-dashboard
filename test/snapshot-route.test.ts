@@ -37,7 +37,9 @@ function fakeRes() {
   return res as unknown as ServerResponse & { status: number; headers: Record<string, string | number>; body: string }
 }
 
-function fakeCtx(provider: { snapshot(query: SnapshotQuery): Promise<SnapshotV1> }) {
+const generation = (commitGeneration = 1, stateGeneration = 1) => ({ commitGeneration, stateGeneration })
+
+function fakeCtx(provider: { snapshot(query: SnapshotQuery): Promise<SnapshotV1>; getGeneration(): Promise<{ commitGeneration: number; stateGeneration: number }> }) {
   let handler: ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>) | undefined
   const ctx = {
     webServer: {
@@ -63,6 +65,7 @@ describe('snapshot route', () => {
   it('returns 200 with no-store for a valid snapshot', async () => {
     const calls: SnapshotQuery[] = []
     const provider = {
+      async getGeneration() { return generation() },
       async snapshot(query: SnapshotQuery) {
         calls.push(query)
         return fakeSnapshot()
@@ -78,7 +81,10 @@ describe('snapshot route', () => {
   })
 
   it('returns 400 for invalid query parameters', async () => {
-    const provider = { async snapshot() { return fakeSnapshot() } }
+    const provider = {
+      async getGeneration() { return generation() },
+      async snapshot() { return fakeSnapshot() },
+    }
     const fx = fakeCtx(provider)
     registerSnapshotRoute(fx.ctx, provider)
     expect((await fx.call('/api/token-dashboard/snapshot?weeks=999')).status).toBe(400)
@@ -89,6 +95,7 @@ describe('snapshot route', () => {
     let resolveSnapshot!: (value: SnapshotV1) => void
     let calls = 0
     const provider = {
+      async getGeneration() { return generation() },
       snapshot() {
         calls += 1
         return new Promise<SnapshotV1>((resolve) => { resolveSnapshot = resolve })
@@ -98,6 +105,7 @@ describe('snapshot route', () => {
     registerSnapshotRoute(fx.ctx, provider)
     const first = fx.call('/api/token-dashboard/snapshot?weeks=26&offsetWeeks=0')
     const second = fx.call('/api/token-dashboard/snapshot?weeks=26&offsetWeeks=0')
+    await new Promise((resolve) => setTimeout(resolve, 0))
     resolveSnapshot(fakeSnapshot())
     const [res1, res2] = await Promise.all([first, second])
     expect(res1.status).toBe(200)
@@ -109,8 +117,40 @@ describe('snapshot route', () => {
     expect(calls).toBe(1)
   })
 
+  it('invalidates the cache when commit or state generation advances', async () => {
+    let current = generation()
+    let calls = 0
+    const provider = {
+      async getGeneration() { return current },
+      async snapshot() {
+        calls += 1
+        return fakeSnapshot({
+          asOf: { committedAtMs: calls, commitGeneration: current.commitGeneration, stateGeneration: current.stateGeneration },
+          summary: { today: calls, week: 0, month30: 0, all: 0, cacheReadAll: 0, sessionCount: 0 },
+        })
+      },
+    }
+    const fx = fakeCtx(provider)
+    registerSnapshotRoute(fx.ctx, provider)
+    const url = '/api/token-dashboard/snapshot?weeks=1&offsetWeeks=0'
+
+    expect(JSON.parse((await fx.call(url)).body).value.summary.today).toBe(1)
+    // Same generation: served from cache.
+    expect(JSON.parse((await fx.call(url)).body).value.summary.today).toBe(1)
+    expect(calls).toBe(1)
+
+    current = generation(2, 1)
+    expect(JSON.parse((await fx.call(url)).body).value.summary.today).toBe(2)
+    expect(calls).toBe(2)
+
+    current = generation(2, 2)
+    expect(JSON.parse((await fx.call(url)).body).value.summary.today).toBe(3)
+    expect(calls).toBe(3)
+  })
+
   it('returns 503 for provider errors and does not leak stacks', async () => {
     const provider = {
+      async getGeneration() { return generation() },
       async snapshot() { throw new Error('secret stack') },
     }
     const fx = fakeCtx(provider)

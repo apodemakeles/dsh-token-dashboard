@@ -6,10 +6,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { ErrorCodes, SNAPSHOT_TIMEOUT_MS, type SnapshotQuery, type SnapshotV1 } from './contracts'
+import { ErrorCodes, SNAPSHOT_TIMEOUT_MS, type GenerationInfo, type SnapshotQuery, type SnapshotV1 } from './contracts'
 
 export interface SnapshotProvider {
   snapshot(query: SnapshotQuery): Promise<SnapshotV1>
+  /** Cheap read of the store generations that invalidate every cached snapshot. */
+  getGeneration(): Promise<GenerationInfo>
 }
 
 const DEFAULT_WEEKS = 26
@@ -17,16 +19,20 @@ const MAX_WEEKS = 52
 const MAX_OFFSET_WEEKS = 10_000
 const CACHE_MAX = 8
 
-interface CachedSnapshot {
-  readonly snapshot: SnapshotV1
-}
-
 interface WebRouteLike {
   register(route: { kind: 'exact'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void
 }
 
 function queryOf(req: IncomingMessage): URLSearchParams {
   return new URL(req.url ?? '/', 'http://localhost').searchParams
+}
+
+/** Local calendar day; the store aggregates `today` and day buckets in local time. */
+function localDateKey(now = new Date()): string {
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 function intOf(params: URLSearchParams, name: string, fallback: number, min: number, max: number): number | null {
@@ -39,9 +45,7 @@ function intOf(params: URLSearchParams, name: string, fallback: number, min: num
 
 export function registerSnapshotRoute(ctx: Context, provider: SnapshotProvider): () => void {
   const inflight = new Map<string, Promise<SnapshotV1>>()
-  const cache = new Map<string, CachedSnapshot>()
-  let lastCommitGeneration = 0
-  let lastStateGeneration = 0
+  const cache = new Map<string, SnapshotV1>()
 
   const dispose = (ctx.webServer as unknown as WebRouteLike).register({
     kind: 'exact',
@@ -56,11 +60,15 @@ export function registerSnapshotRoute(ctx: Context, provider: SnapshotProvider):
         const query: SnapshotQuery = { weeks, offsetWeeks }
 
         res.setHeader('cache-control', 'no-store')
-        const localDate = new Date().toISOString().slice(0, 10)
-        const cacheKey = `${weeks}:${offsetWeeks}:${localDate}:${lastCommitGeneration}:${lastStateGeneration}`
+        const localDate = localDateKey()
+        // Read the live generation before consulting the cache. Deriving the key
+        // from the last queried snapshot would pin the entry forever: a cache hit
+        // never queries the Worker again, so it could never learn about a commit.
+        const generation = await provider.getGeneration()
+        const cacheKey = `${weeks}:${offsetWeeks}:${localDate}:${generation.commitGeneration}:${generation.stateGeneration}`
         const cached = cache.get(cacheKey)
         if (cached !== undefined) {
-          return ok(res, cached.snapshot)
+          return ok(res, cached)
         }
 
         let snapshotPromise = inflight.get(cacheKey)
@@ -75,10 +83,8 @@ export function registerSnapshotRoute(ctx: Context, provider: SnapshotProvider):
         }
         try {
           const snapshot = await snapshotPromise
-          lastCommitGeneration = snapshot.asOf.commitGeneration
-          lastStateGeneration = snapshot.asOf.stateGeneration
           const resultKey = `${weeks}:${offsetWeeks}:${localDate}:${snapshot.asOf.commitGeneration}:${snapshot.asOf.stateGeneration}`
-          cache.set(resultKey, { snapshot })
+          cache.set(resultKey, snapshot)
           if (cache.size > CACHE_MAX) {
             const oldest = cache.keys().next().value
             if (oldest !== undefined) cache.delete(oldest)

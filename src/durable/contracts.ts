@@ -132,8 +132,14 @@ export interface ProjectionState {
   readonly errors: ReadonlyMap<number, IngestionErrorRecord>
 }
 
+/** Store generations that invalidate every cached snapshot when either advances. */
+export interface GenerationInfo {
+  readonly commitGeneration: number
+  readonly stateGeneration: number
+}
+
 /** Stable cross-thread command names. */
-export type WorkerCommandType = 'init' | 'project' | 'snapshot' | 'drain' | 'shutdown' | 'begin_run' | 'activate_run' | 'mark_run_clean' | 'get_last_run' | 'upsert_lifecycle' | 'get_lifecycle' | 'get_checkpoint' | 'get_projection_progress' | 'update_projection_progress' | 'set_projection_ready' | 'get_baselines'
+export type WorkerCommandType = 'init' | 'project' | 'snapshot' | 'drain' | 'get_generation' | 'shutdown' | 'begin_run' | 'activate_run' | 'mark_run_clean' | 'get_last_run' | 'upsert_lifecycle' | 'get_lifecycle' | 'get_checkpoint' | 'get_projection_progress' | 'update_projection_progress' | 'set_projection_ready' | 'get_baselines'
 
 export interface SnapshotQuery {
   readonly weeks: number
@@ -167,6 +173,13 @@ export interface WorkerSnapshotRequest {
 
 export interface WorkerDrainRequest {
   readonly type: 'drain'
+  readonly requestId: string
+  readonly hostGeneration: string
+  readonly protocolVersion: number
+}
+
+export interface WorkerGetGenerationRequest {
+  readonly type: 'get_generation'
   readonly requestId: string
   readonly hostGeneration: string
   readonly protocolVersion: number
@@ -274,6 +287,7 @@ export type WorkerCommand =
   | WorkerProjectRequest
   | WorkerSnapshotRequest
   | WorkerDrainRequest
+  | WorkerGetGenerationRequest
   | WorkerShutdownRequest
   | WorkerBeginRunRequest
   | WorkerActivateRunRequest

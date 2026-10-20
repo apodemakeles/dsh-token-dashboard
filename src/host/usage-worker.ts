@@ -70,6 +70,13 @@ export class UsageWorker {
           this.reply(command.requestId, { ok: true, value: snapshot })
           return
         }
+        case 'get_generation': {
+          this.reply(command.requestId, {
+            ok: true,
+            value: { commitGeneration: this.store.commitGenerationValue, stateGeneration: this.store.stateGenerationValue },
+          })
+          return
+        }
         case 'drain': {
           this.reply(command.requestId, {
             ok: true,

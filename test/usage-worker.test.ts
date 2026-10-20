@@ -75,6 +75,10 @@ describe('UsageWorker', () => {
       expect((snap.value as { projection: { pendingBatches: number } }).projection.pendingBatches).toBe(1)
     }
 
+    const generation = await send({ type: 'get_generation', requestId: 'r-generation', hostGeneration: 'gen-1', protocolVersion: PROTOCOL_VERSION })
+    expect(generation.ok).toBe(true)
+    if (generation.ok) expect(generation.value).toMatchObject({ commitGeneration: 1 })
+
     const drain = await send({ type: 'drain', requestId: 'r-drain', hostGeneration: 'gen-1', protocolVersion: PROTOCOL_VERSION })
     expect(drain.ok).toBe(true)
     if (drain.ok) expect(drain.value).toMatchObject({ commitGeneration: 1 })
