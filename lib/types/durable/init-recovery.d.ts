@@ -202,12 +202,21 @@ export declare class InitRecoveryCoordinator {
     private previousEpochId;
     constructor(options: InitRecoveryOptions);
     get isAborted(): boolean;
+    /** Which ctx.sessionPersistence generation the seam resolved; surfaced in diagnostics. */
+    get persistenceGeneration(): 'handle' | 'snapshot' | 'unsupported';
     /** Start the coordinator: arm run, activate with baseline, then run scan. */
     start(): Promise<void>;
     /** Arm the run epoch and activate with a revision baseline; no scan yet. */
     arm(): Promise<void>;
     /** Run initialization/recovery/ready transition after arm(). */
     scan(): Promise<void>;
+    /**
+     * Heal the projection against the live corpus on a clean startup: scan
+     * every session whose checkpoint is missing or whose stored revision no
+     * longer matches the snapshot's revision. Batches are keyed and checkpoints
+     * advance, so re-scanning an unchanged session is a no-op read.
+     */
+    private runReconciliation;
     /** Abort background scan/recovery; committed work is preserved. */
     abort(): void;
     private runInitialization;

@@ -13,6 +13,7 @@ import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { UsageCollector } from './durable/collector'
+import { diag } from './durable/diag'
 import { InitRecoveryCoordinator, WorkerCoordinatorStore, type PersistenceLike } from './durable/init-recovery'
 import { canonicalDbPath, tokenDashboardDir } from './durable/maintenance'
 import { registerSnapshotRoute } from './durable/snapshot-route'
@@ -50,6 +51,7 @@ export function apply(ctx: Context): void {
       collector.onEvent(session as never, event as never)
     }
     const disposeListener = ctx.on('session/event', onEvent)
+    diag('host', 'session/event listener registered')
     const disposeRoutes = registerSnapshotRoute(ctx, worker)
 
     // Only a run that armed its epoch may be recorded as a clean exit: a startup
@@ -58,15 +60,20 @@ export function apply(ctx: Context): void {
     let armed = false
     void (async () => {
       try {
+        const t0 = Date.now()
         await worker.start()
+        diag('host', `worker started in ${Date.now() - t0}ms`)
         await coordinator.arm()
+        diag('host', `armed in ${Date.now() - t0}ms (persistence seam: ${coordinator.persistenceGeneration})`)
         collector.start()
         armed = true
         void coordinator.scan().catch((error) => {
           console.error('dsh-token-dashboard: projection scan failed', error)
+          diag('host', 'scan failed', error)
         })
       } catch (error) {
         console.error('dsh-token-dashboard: durable projection startup failed', error)
+        diag('host', 'startup failed; live collection stays disabled', error)
       }
     })()
 

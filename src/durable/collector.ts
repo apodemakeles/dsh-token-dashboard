@@ -15,6 +15,7 @@ import {
   type ProjectionBatch,
   type UsageDelta,
 } from './contracts'
+import { diag } from './diag'
 import { normalizeEventDelta } from './projector'
 
 /** Minimal live Session shape used by the collector. */
@@ -97,6 +98,7 @@ export class UsageCollector {
 
   start(): void {
     this.accepting = true
+    diag('collector', 'start: accepting live events')
   }
 
   stop(): void {
@@ -153,9 +155,18 @@ export class UsageCollector {
   }
 
   private enqueue(pipeline: Pipeline, event: SessionEvent): void {
+    // A pipeline created mid-log (the host activated after the session
+    // already had history) baselines at the first delivered event instead of
+    // dropping it: the prefix below is the scanner's job, and the first
+    // delivered event is very often the usage-bearing one.
+    if (pipeline.expectedSeq === 0 && event.seq > 0) {
+      pipeline.expectedSeq = event.seq
+      diag('collector', `pipeline ${pipeline.lifecycle.sessionId} baselined at seq ${event.seq} (mid-log attach)`)
+    }
     if (event.seq < pipeline.expectedSeq) return
     if (event.seq > pipeline.expectedSeq) {
       pipeline.resyncRequired = true
+      diag('collector', `pipeline ${pipeline.lifecycle.sessionId} gap: got seq ${event.seq}, expected ${pipeline.expectedSeq}; dropping to resync`)
       pipeline.expectedSeq = event.seq + 1
       return
     }
@@ -238,15 +249,17 @@ export class UsageCollector {
   private async flushAndSend(pipeline: Pipeline, batch: ProjectionBatch): Promise<void> {
     try {
       await this.flushWithRetry(pipeline.session)
-    } catch {
+    } catch (error) {
       pipeline.resyncRequired = true
+      diag('collector', `flush failed for ${pipeline.lifecycle.sessionId} seqs ${batch.fromSeq}-${batch.toSeq}; batch dropped for resync`, error)
       return
     }
     try {
       await this.worker.project(batch)
       pipeline.pendingDeltaCount = Math.max(0, pipeline.pendingDeltaCount - batch.deltas.length)
-    } catch {
+    } catch (error) {
       pipeline.resyncRequired = true
+      diag('collector', `worker.project failed for ${pipeline.lifecycle.sessionId} seqs ${batch.fromSeq}-${batch.toSeq}; batch dropped for resync`, error)
     }
   }
 

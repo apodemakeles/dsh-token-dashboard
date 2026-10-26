@@ -6,6 +6,7 @@
 
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ProjectionBatch, LifecycleIdentity } from './contracts'
+import { diag } from './diag'
 import { normalizeEventDeltas } from './projector'
 import type { SqliteUsageStore } from './sqlite-store'
 import type { UsageCollector } from './collector'
@@ -212,6 +213,11 @@ export class InitRecoveryCoordinator {
     return this.aborted
   }
 
+  /** Which ctx.sessionPersistence generation the seam resolved; surfaced in diagnostics. */
+  get persistenceGeneration(): 'handle' | 'snapshot' | 'unsupported' {
+    return this.persistence.generation
+  }
+
   /** Start the coordinator: arm run, activate with baseline, then run scan. */
   async start(): Promise<void> {
     await this.arm()
@@ -252,9 +258,53 @@ export class InitRecoveryCoordinator {
     } else if (this.previousState === 'active' || this.previousState === 'arming') {
       await this.runRecovery(this.previousState, this.previousEpochId, this.snapshots, [])
     } else {
-      // Clean/ready startup: nothing to do.
+      // Clean/ready startup. The logs are the authority and SQLite is a
+      // projection, so sessions that changed since the last recorded
+      // checkpoint (a window while this plugin was disabled, usage that
+      // happened before this run activated, or writes by another profile
+      // sharing the home) are still reconciled here; an unchanged corpus
+      // costs one checkpoint comparison per session.
+      await this.runReconciliation(this.snapshots)
       await this.store.updateProjectionProgress({ phase: 'ready' }, this.now())
     }
+  }
+
+  /**
+   * Heal the projection against the live corpus on a clean startup: scan
+   * every session whose checkpoint is missing or whose stored revision no
+   * longer matches the snapshot's revision. Batches are keyed and checkpoints
+   * advance, so re-scanning an unchanged session is a no-op read.
+   */
+  private async runReconciliation(snapshots: ReadonlyArray<SessionSnapshotLike>): Promise<void> {
+    const candidates: SessionSnapshotLike[] = []
+    for (const snapshot of snapshots) {
+      if (this.aborted) return
+      const identity = identityFromSnapshot(snapshot)
+      const pk = await this.store.getLifecycle(identity)
+      const revision = String(snapshot.revision)
+      if (pk === undefined) {
+        candidates.push(snapshot)
+        continue
+      }
+      const checkpoint = await this.store.getCheckpoint(pk)
+      if (!checkpoint.bootstrapComplete || checkpoint.sourceRevision !== revision) candidates.push(snapshot)
+    }
+    if (candidates.length === 0) return
+
+    let failed = 0
+    const reasons = new FailureLog()
+    for (const snapshot of candidates) {
+      if (this.aborted) return
+      try {
+        const checkpoint = await this.store.getCheckpoint(await this.store.upsertLifecycle(identityFromSnapshot(snapshot)))
+        await this.scanLifecycle(snapshot, checkpoint.lastSeq + 1, false)
+      } catch (error) {
+        failed += 1
+        reasons.record(snapshot.header.id, error)
+        diag('reconcile', `session ${snapshot.header.id} could not be reconciled; retried on the next startup`, error)
+      }
+    }
+    reasons.report()
   }
 
   /** Abort background scan/recovery; committed work is preserved. */
