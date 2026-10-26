@@ -1,7 +1,7 @@
 {
   "name": "@apodemakeles/dsh-token-dashboard",
   "description": "DSH web GUI token-consumption heatmap: a daily/weekly total-token usage panel fed by session-log usage events",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
@@ -13,7 +13,8 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.5.0",
+    "dsh": ">=0.1.0-rc.6 <0.3.0"
   },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -39,7 +40,6 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-locale"
       ]
