@@ -1,3 +1,7 @@
+> **已归档 / 已被取代。** 本插件已并入
+> [`@apodemakeles/dsh-kit`](https://github.com/apodemakeles/dsh-kit)（token 仪表盘与
+> 轮次完成通知合并为一个 bundle）。本仓库已归档，不再维护。
+
 # @apodemakeles/dsh-token-dashboard
 
 [English](README.md) | 中文

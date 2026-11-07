@@ -1,3 +1,8 @@
+> **Archived / superseded.** This plugin is now part of
+> [`@apodemakeles/dsh-kit`](https://github.com/apodemakeles/dsh-kit), which merges
+> the token dashboard and turn notifications into one bundle. This repository is
+> archived and no longer maintained.
+
 # @apodemakeles/dsh-token-dashboard
 
 English | [中文](README.zh.md)
